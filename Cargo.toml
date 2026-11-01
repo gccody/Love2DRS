@@ -1,0 +1,47 @@
+[package]
+name = "love2drs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A LÖVE-inspired 2D game framework for Rust: as easy as love2d, batched and fast on wgpu."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["gamedev", "2d", "game", "wgpu", "love2d"]
+categories = ["game-engines", "graphics", "rendering"]
+exclude = ["/assets/icon.svg", "/screenshots"]
+
+[features]
+default = ["audio", "png", "jpeg"]
+## Sound playback via rodio (wav, ogg/vorbis, mp3, flac).
+audio = ["dep:rodio"]
+## PNG decoding for `Graphics::new_image`.
+png = ["image/png"]
+## JPEG decoding for `Graphics::new_image`.
+jpeg = ["image/jpeg"]
+
+[dependencies]
+wgpu = "30"
+winit = "0.30"
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+ab_glyph = "0.2"
+log = "0.4"
+image = { version = "0.25", default-features = false }
+rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "vorbis", "mp3", "flac"], optional = true }
+
+# Dependencies (wgpu, image decoding, audio) are compiled with optimizations even in
+# debug builds of the examples so they stay smooth while iterating.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[[example]]
+name = "starfall"
+required-features = ["audio"]
+
+[[example]]
+name = "platformer"
+required-features = ["audio"]
