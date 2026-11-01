@@ -5,8 +5,24 @@
 //! every controller (Cross on PlayStation, B on Nintendo). Requires the
 //! `gamepad` cargo feature (on by default). Without it, or when the platform has
 //! no gamepad backend, [`Gamepads`] simply reports no controllers.
+//!
+//! On Windows and macOS, PlayStation controllers are read straight over HID
+//! instead (see `sony.rs`), since gilrs can't rumble them there.
 
+#[cfg(feature = "gamepad")]
+use std::time::{Duration, Instant};
+
+#[cfg(feature = "gamepad")]
+use super::sony;
 use crate::math::{Vec2, vec2};
+
+/// How long a PlayStation pad that gilrs reports may take to show up over HID
+/// before it's shown through gilrs instead (e.g. another app holds it open).
+#[cfg(feature = "gamepad")]
+const HID_GRACE: Duration = Duration::from_secs(2);
+/// How often to look for it over HID in the meantime.
+#[cfg(feature = "gamepad")]
+const HID_RESCAN: Duration = Duration::from_millis(250);
 
 /// Identifies one connected controller. Stays the same while it is connected;
 /// a controller that is unplugged and plugged back in usually keeps its id.
@@ -62,7 +78,7 @@ pub enum GamepadButton {
     DPadRight,
 }
 
-const BUTTONS: usize = GamepadButton::DPadRight as usize + 1;
+pub(crate) const BUTTONS: usize = GamepadButton::DPadRight as usize + 1;
 
 impl GamepadButton {
     /// Every button, in declaration order.
@@ -153,7 +169,7 @@ pub enum GamepadAxis {
     RightTrigger,
 }
 
-const AXES: usize = GamepadAxis::RightTrigger as usize + 1;
+pub(crate) const AXES: usize = GamepadAxis::RightTrigger as usize + 1;
 
 impl GamepadAxis {
     /// Every axis, in declaration order.
@@ -190,7 +206,31 @@ pub struct Gamepad {
     axes: [f32; AXES],
     vibration_supported: bool,
     #[cfg(feature = "gamepad")]
-    effect: Option<gilrs::ff::Effect>,
+    source: Source,
+}
+
+/// Where a controller's input comes from and its rumble goes.
+#[cfg(feature = "gamepad")]
+enum Source {
+    Gilrs {
+        id: gilrs::GamepadId,
+        effect: Option<gilrs::ff::Effect>,
+    },
+    /// A PlayStation controller driven directly (Windows and macOS).
+    Hid(sony::Pad),
+    /// Hand-built pads in unit tests.
+    #[cfg(test)]
+    Test,
+}
+
+/// A PlayStation controller gilrs reports, kept out of the list because it's
+/// read over HID instead.
+#[cfg(feature = "gamepad")]
+struct Hidden {
+    gilrs: gilrs::GamepadId,
+    ids: (u16, u16),
+    /// When it was last expected to show up over HID.
+    since: Instant,
 }
 
 impl Gamepad {
@@ -253,7 +293,11 @@ impl Gamepad {
     }
 
     /// Whether [`Gamepads::set_vibration`] can rumble this controller.
-    /// Rumble is available on Windows and Linux; macOS reports `false`.
+    ///
+    /// Xbox-style controllers rumble on Windows and Linux. PlayStation
+    /// controllers (DualShock 4, DualSense, DualSense Edge) rumble on Windows,
+    /// macOS and Linux, over USB or Bluetooth. Other controllers on macOS
+    /// report `false`.
     pub fn is_vibration_supported(&self) -> bool {
         self.vibration_supported
     }
@@ -280,6 +324,47 @@ impl Gamepad {
         self.pressed = [false; BUTTONS];
         self.released = [false; BUTTONS];
     }
+
+    #[cfg(feature = "gamepad")]
+    fn gilrs_id(&self) -> Option<gilrs::GamepadId> {
+        match self.source {
+            Source::Gilrs { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "gamepad")]
+    fn hid(&self) -> Option<&sony::Pad> {
+        match &self.source {
+            Source::Hid(hid) => Some(hid),
+            _ => None,
+        }
+    }
+
+    /// Brings the state up to date with a HID snapshot, queuing events for
+    /// what changed.
+    #[cfg(feature = "gamepad")]
+    fn apply(&mut self, input: &sony::Input, events: &mut Vec<GamepadEvent>) {
+        for b in GamepadButton::ALL {
+            let down = input.down[b as usize];
+            if down != self.is_down(b) {
+                if down {
+                    self.press(b);
+                    events.push(GamepadEvent::Pressed(self.id, b));
+                } else {
+                    self.release(b);
+                    events.push(GamepadEvent::Released(self.id, b));
+                }
+            }
+        }
+        for a in GamepadAxis::ALL {
+            let v = input.axes[a as usize];
+            if self.axes[a as usize] != v {
+                self.axes[a as usize] = v;
+                events.push(GamepadEvent::Axis(self.id, a, v));
+            }
+        }
+    }
 }
 
 /// A gamepad event, translated from the backend and replayed as `Game` callbacks.
@@ -303,6 +388,12 @@ pub struct Gamepads {
     pub(crate) events: Vec<GamepadEvent>,
     #[cfg(feature = "gamepad")]
     gilrs: Option<gilrs::Gilrs>,
+    #[cfg(feature = "gamepad")]
+    sony: sony::Hid,
+    #[cfg(feature = "gamepad")]
+    hidden: Vec<Hidden>,
+    #[cfg(feature = "gamepad")]
+    next_scan: Option<Instant>,
 }
 
 impl Gamepads {
@@ -323,6 +414,12 @@ impl Gamepads {
                     None
                 }
             },
+            #[cfg(feature = "gamepad")]
+            sony: sony::Hid::new(),
+            #[cfg(feature = "gamepad")]
+            hidden: Vec::new(),
+            #[cfg(feature = "gamepad")]
+            next_scan: None,
         };
         // Controllers that were plugged in before the game started are
         // announced as `gamepad_added` on the first frame, like LÖVE does.
@@ -332,6 +429,11 @@ impl Gamepads {
             for id in ids {
                 pads.connect(id);
             }
+        }
+        #[cfg(feature = "gamepad")]
+        {
+            pads.scan_hid();
+            pads.next_scan = None;
         }
         pads
     }
@@ -432,23 +534,22 @@ impl Gamepads {
         {
             use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
 
-            let Some(gilrs) = &mut self.gilrs else {
-                return false;
-            };
             let Some(pad) = self.pads.iter_mut().find(|p| p.id == id) else {
-                return false;
-            };
-            let Some(gilrs_id) = gilrs
-                .gamepads()
-                .map(|(gid, _)| gid)
-                .find(|&gid| usize::from(gid) == id.0)
-            else {
                 return false;
             };
             if !pad.vibration_supported {
                 return false;
             }
-            if let Some(old) = pad.effect.take() {
+            let (gilrs_id, slot) = match &mut pad.source {
+                Source::Hid(hid) => return hid.set(left, right, duration),
+                Source::Gilrs { id, effect } => (*id, effect),
+                #[cfg(test)]
+                Source::Test => return false,
+            };
+            let Some(gilrs) = &mut self.gilrs else {
+                return false;
+            };
+            if let Some(old) = slot.take() {
                 let _ = old.stop();
             }
             if left <= 0.0 && right <= 0.0 || duration <= 0.0 {
@@ -485,7 +586,7 @@ impl Gamepads {
                 .finish(gilrs);
             match effect.and_then(|e| e.play().map(|()| e)) {
                 Ok(e) => {
-                    pad.effect = Some(e);
+                    *slot = Some(e);
                     true
                 }
                 Err(e) => {
@@ -510,81 +611,238 @@ impl Gamepads {
     pub(crate) fn poll(&mut self) {
         #[cfg(feature = "gamepad")]
         {
-            use gilrs::EventType as E;
+            self.poll_gilrs();
+            self.poll_hid();
+            self.reconcile_hid(Instant::now());
+        }
+    }
 
-            while let Some(ev) = self.gilrs.as_mut().and_then(|g| g.next_event()) {
-                let id = GamepadId(ev.id.into());
-                match ev.event {
-                    E::Connected => self.connect(ev.id),
-                    E::Disconnected => {
-                        if let Some(i) = self.pads.iter().position(|p| p.id == id) {
-                            self.pads.remove(i);
-                            self.events.push(GamepadEvent::Removed(id));
-                        }
+    #[cfg(feature = "gamepad")]
+    fn poll_gilrs(&mut self) {
+        use gilrs::EventType as E;
+
+        while let Some(ev) = self.gilrs.as_mut().and_then(|g| g.next_event()) {
+            match ev.event {
+                E::Connected => {
+                    self.connect(ev.id);
+                    continue;
+                }
+                E::Disconnected => {
+                    self.hidden.retain(|h| h.gilrs != ev.id);
+                    if let Some(i) = self.pads.iter().position(|p| p.gilrs_id() == Some(ev.id)) {
+                        let id = self.pads.remove(i).id;
+                        self.events.push(GamepadEvent::Removed(id));
                     }
-                    E::ButtonPressed(b, _) => {
-                        if let Some(b) = GamepadButton::from_gilrs(b)
-                            && let Some(pad) = self.pad_mut(id)
-                            && !pad.is_down(b)
-                        {
-                            pad.press(b);
-                            self.events.push(GamepadEvent::Pressed(id, b));
-                        }
+                    continue;
+                }
+                _ => {}
+            }
+            // Pads read over HID are hidden here, so their events are dropped.
+            let Some(id) = self
+                .pads
+                .iter()
+                .find(|p| p.gilrs_id() == Some(ev.id))
+                .map(|p| p.id)
+            else {
+                continue;
+            };
+            match ev.event {
+                E::ButtonPressed(b, _) => {
+                    if let Some(b) = GamepadButton::from_gilrs(b)
+                        && let Some(pad) = self.pad_mut(id)
+                        && !pad.is_down(b)
+                    {
+                        pad.press(b);
+                        self.events.push(GamepadEvent::Pressed(id, b));
                     }
-                    E::ButtonReleased(b, _) => {
-                        if let Some(b) = GamepadButton::from_gilrs(b)
-                            && let Some(pad) = self.pad_mut(id)
-                            && pad.is_down(b)
-                        {
-                            pad.release(b);
-                            self.events.push(GamepadEvent::Released(id, b));
-                        }
+                }
+                E::ButtonReleased(b, _) => {
+                    if let Some(b) = GamepadButton::from_gilrs(b)
+                        && let Some(pad) = self.pad_mut(id)
+                        && pad.is_down(b)
+                    {
+                        pad.release(b);
+                        self.events.push(GamepadEvent::Released(id, b));
                     }
-                    E::ButtonChanged(b, value, _) => {
-                        let axis = match b {
-                            gilrs::Button::LeftTrigger2 => GamepadAxis::LeftTrigger,
-                            gilrs::Button::RightTrigger2 => GamepadAxis::RightTrigger,
-                            _ => continue,
-                        };
-                        self.set_axis(id, axis, value.clamp(0.0, 1.0));
-                    }
-                    E::AxisChanged(a, value, _) => {
-                        let (axis, value) = match a {
-                            gilrs::Axis::LeftStickX => (GamepadAxis::LeftX, value),
-                            gilrs::Axis::LeftStickY => (GamepadAxis::LeftY, -value),
-                            gilrs::Axis::RightStickX => (GamepadAxis::RightX, value),
-                            gilrs::Axis::RightStickY => (GamepadAxis::RightY, -value),
-                            _ => continue,
-                        };
-                        self.set_axis(id, axis, value.clamp(-1.0, 1.0));
-                    }
-                    _ => {}
+                }
+                E::ButtonChanged(b, value, _) => {
+                    let axis = match b {
+                        gilrs::Button::LeftTrigger2 => GamepadAxis::LeftTrigger,
+                        gilrs::Button::RightTrigger2 => GamepadAxis::RightTrigger,
+                        _ => continue,
+                    };
+                    self.set_axis(id, axis, value.clamp(0.0, 1.0));
+                }
+                E::AxisChanged(a, value, _) => {
+                    let (axis, value) = match a {
+                        gilrs::Axis::LeftStickX => (GamepadAxis::LeftX, value),
+                        gilrs::Axis::LeftStickY => (GamepadAxis::LeftY, -value),
+                        gilrs::Axis::RightStickX => (GamepadAxis::RightX, value),
+                        gilrs::Axis::RightStickY => (GamepadAxis::RightY, -value),
+                        _ => continue,
+                    };
+                    self.set_axis(id, axis, value.clamp(-1.0, 1.0));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Applies what the PlayStation pads' worker threads have read.
+    #[cfg(feature = "gamepad")]
+    fn poll_hid(&mut self) {
+        let mut i = 0;
+        while i < self.pads.len() {
+            let pad = &mut self.pads[i];
+            let Some(hid) = pad.hid() else {
+                i += 1;
+                continue;
+            };
+            let msgs: Vec<_> = hid.messages().collect();
+            let mut gone = false;
+            for msg in msgs {
+                match msg {
+                    sony::Msg::Input(input) => pad.apply(&input, &mut self.events),
+                    sony::Msg::Gone => gone = true,
                 }
             }
+            if !gone {
+                i += 1;
+                continue;
+            }
+            let pad = self.pads.remove(i);
+            self.events.push(GamepadEvent::Removed(pad.id));
+            // If gilrs still sees it, it may come back (or need gilrs instead).
+            let ids = pad.hid().map(sony::Pad::ids);
+            let now = Instant::now();
+            for h in self.hidden.iter_mut().filter(|h| Some(h.ids) == ids) {
+                h.since = now;
+                self.next_scan = Some(now + HID_RESCAN);
+            }
+        }
+    }
+
+    /// Makes sure every PlayStation pad gilrs reports is covered by a HID pad:
+    /// scans for it while it isn't, and shows gilrs's copy instead once
+    /// [`HID_GRACE`] runs out.
+    #[cfg(feature = "gamepad")]
+    fn reconcile_hid(&mut self, now: Instant) {
+        if self.next_scan.is_some_and(|t| now >= t) {
+            self.next_scan = None;
+            self.scan_hid();
+        }
+        let mut uncovered = Vec::new();
+        for (i, h) in self.hidden.iter().enumerate() {
+            let hid_pads = self
+                .pads
+                .iter()
+                .filter(|p| p.hid().map(sony::Pad::ids) == Some(h.ids))
+                .count();
+            let before = self.hidden[..i].iter().filter(|o| o.ids == h.ids).count();
+            if before >= hid_pads {
+                uncovered.push(i);
+            }
+        }
+        for &i in uncovered.iter().rev() {
+            if now.duration_since(self.hidden[i].since) >= HID_GRACE {
+                let h = self.hidden.remove(i);
+                log::warn!(
+                    "couldn't read a PlayStation controller over HID; using it without rumble"
+                );
+                self.add_gilrs_pad(h.gilrs);
+            } else if self.next_scan.is_none() {
+                self.next_scan = Some(now + HID_RESCAN);
+            }
+        }
+    }
+
+    /// Opens PlayStation controllers that aren't open yet.
+    #[cfg(feature = "gamepad")]
+    fn scan_hid(&mut self) {
+        let found = {
+            let open: Vec<_> = self
+                .pads
+                .iter()
+                .filter_map(|p| p.hid().map(sony::Pad::path))
+                .collect();
+            self.sony.scan(&open)
+        };
+        for hid in found {
+            let id = self.free_id();
+            self.pads.push(Gamepad {
+                id,
+                name: hid.name().to_owned(),
+                down: [false; BUTTONS],
+                pressed: [false; BUTTONS],
+                released: [false; BUTTONS],
+                axes: [0.0; AXES],
+                vibration_supported: true,
+                source: Source::Hid(hid),
+            });
+            self.events.push(GamepadEvent::Added(id));
         }
     }
 
     #[cfg(feature = "gamepad")]
     fn connect(&mut self, gilrs_id: gilrs::GamepadId) {
-        let id = GamepadId(gilrs_id.into());
         let Some(gilrs) = &self.gilrs else { return };
-        if self.pads.iter().any(|p| p.id == id) {
+        if self.pads.iter().any(|p| p.gilrs_id() == Some(gilrs_id))
+            || self.hidden.iter().any(|h| h.gilrs == gilrs_id)
+        {
             return;
         }
         let Some(gp) = gilrs.connected_gamepad(gilrs_id) else {
             return;
         };
+        if let (Some(vid), Some(pid)) = (gp.vendor_id(), gp.product_id())
+            && sony::is_supported(vid, pid)
+            && self.sony.available()
+        {
+            let now = Instant::now();
+            self.hidden.push(Hidden {
+                gilrs: gilrs_id,
+                ids: (vid, pid),
+                since: now,
+            });
+            self.next_scan = Some(now);
+            return;
+        }
+        self.add_gilrs_pad(gilrs_id);
+    }
+
+    #[cfg(feature = "gamepad")]
+    fn add_gilrs_pad(&mut self, gilrs_id: gilrs::GamepadId) {
+        let Some(gp) = self
+            .gilrs
+            .as_ref()
+            .and_then(|g| g.connected_gamepad(gilrs_id))
+        else {
+            return;
+        };
+        let (name, ff) = (gp.name().to_owned(), gp.is_ff_supported());
+        let id = self.free_id();
         self.pads.push(Gamepad {
             id,
-            name: gp.name().to_owned(),
+            name,
             down: [false; BUTTONS],
             pressed: [false; BUTTONS],
             released: [false; BUTTONS],
             axes: [0.0; AXES],
-            vibration_supported: gp.is_ff_supported(),
-            effect: None,
+            vibration_supported: ff,
+            source: Source::Gilrs {
+                id: gilrs_id,
+                effect: None,
+            },
         });
         self.events.push(GamepadEvent::Added(id));
+    }
+
+    /// The lowest id no connected pad uses, so a replugged pad usually gets
+    /// its old id back.
+    #[cfg(feature = "gamepad")]
+    fn free_id(&self) -> GamepadId {
+        let used = |i: usize| self.pads.iter().any(|p| p.id.0 == i);
+        GamepadId((0..).find(|&i| !used(i)).unwrap_or(0))
     }
 
     #[cfg(feature = "gamepad")]
@@ -623,7 +881,7 @@ mod tests {
             axes: [0.0; AXES],
             vibration_supported: false,
             #[cfg(feature = "gamepad")]
-            effect: None,
+            source: Source::Test,
         }
     }
 
@@ -633,6 +891,12 @@ mod tests {
             events: Vec::new(),
             #[cfg(feature = "gamepad")]
             gilrs: None,
+            #[cfg(feature = "gamepad")]
+            sony: sony::Hid::disabled(),
+            #[cfg(feature = "gamepad")]
+            hidden: Vec::new(),
+            #[cfg(feature = "gamepad")]
+            next_scan: None,
         }
     }
 

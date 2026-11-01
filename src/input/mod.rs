@@ -3,6 +3,8 @@
 pub mod gamepad;
 pub mod keyboard;
 pub mod mouse;
+#[cfg(feature = "gamepad")]
+mod sony;
 pub mod touch;
 
 pub use gamepad::{Gamepad, GamepadAxis, GamepadButton, GamepadId, Gamepads};

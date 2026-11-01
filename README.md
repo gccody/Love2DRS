@@ -151,7 +151,10 @@ For geometry that doesn't move, a `SpriteBatch` avoids that cost entirely.
   background is never left stuck down. Check `ctx.window.has_focus()` if your game should ignore it.
   Linux users need read access to `/dev/input/event*`, which desktop distributions grant to the
   logged-in user.
-  Rumble works on Windows and Linux. macOS has no rumble API in gilrs, so `set_vibration` returns `false` there.
+  Rumble works on Windows and Linux. PlayStation controllers (DualShock 4, DualSense, DualSense
+  Edge) rumble on Windows and macOS too, over USB or Bluetooth: love2drs reads and drives them
+  directly over HID there, since the OS gamepad APIs can't rumble them. Other controllers can't
+  rumble on macOS, so `set_vibration` returns `false` for them.
 - **Touch** events come from touchscreens on Windows and Linux. macOS has no touchscreens: trackpad
   gestures arrive as mouse and wheel events, so `ctx.touch` stays empty there. The OS also sends
   emulated mouse events for the first finger, so a tap reaches both `touch_pressed` and `mouse_pressed`.

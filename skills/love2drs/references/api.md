@@ -346,7 +346,8 @@ LeftStick RightStick LeftShoulder RightShoulder LeftTrigger RightTrigger DPadUp 
 DPadRight`. `GamepadAxis`: `LeftX LeftY RightX RightY` (-1..1, **y down**) and `LeftTrigger
 RightTrigger` (0..1). Both have `ALL` and `name()` (LÖVE names, e.g. `"dpup"`, `"triggerleft"`).
 `GamepadId::index()` gives a `usize`. Stick values have a dead zone applied already. Controller
-input keeps arriving while the window is unfocused or minimized; macOS has no rumble.
+input keeps arriving while the window is unfocused or minimized. Rumble: Windows and Linux, plus
+PlayStation pads (USB or Bluetooth) on macOS; other pads on macOS can't (`false`).
 
 ## Touch (`ctx.touch`)
 
