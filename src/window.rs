@@ -73,6 +73,15 @@ impl Window {
         self.inner.set_minimized(true);
     }
 
+    /// Whether the window is minimized. While it is, the game keeps running
+    /// but frames are limited to 30 per second.
+    pub fn is_minimized(&self) -> bool {
+        // Wayland can't report minimization; a zero-sized window counts too
+        // (that is how Windows reports it).
+        let size = self.inner.inner_size();
+        self.inner.is_minimized().unwrap_or(false) || size.width == 0 || size.height == 0
+    }
+
     /// Maximizes the window.
     pub fn maximize(&mut self) {
         self.inner.set_maximized(true);

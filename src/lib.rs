@@ -37,6 +37,8 @@
 //! | `love.graphics`  | [`ctx.graphics`](graphics::Graphics) |
 //! | `love.keyboard`  | [`ctx.keyboard`](input::Keyboard) |
 //! | `love.mouse`     | [`ctx.mouse`](input::Mouse)      |
+//! | `love.joystick`  | [`ctx.gamepad`](input::Gamepads) |
+//! | `love.touch`     | [`ctx.touch`](input::Touch)      |
 //! | `love.audio`     | [`ctx.audio`](audio::Audio)      |
 //! | `love.timer`     | [`ctx.timer`](timer::Timer)      |
 //! | `love.window`    | [`ctx.window`](window::Window)   |
@@ -88,7 +90,10 @@ pub mod prelude {
         Align, BlendMode, Canvas, Color, DrawParams, Drawable, FilterMode, Font, Graphics, Image,
         ImageData, Quad, Shader, SpriteBatch, Vertex, WrapMode,
     };
-    pub use crate::input::{Key, Keyboard, Mouse, MouseButton};
+    pub use crate::input::{
+        Gamepad, GamepadAxis, GamepadButton, GamepadId, Gamepads, Key, Keyboard, Mouse,
+        MouseButton, Touch, TouchId, TouchPoint,
+    };
     pub use crate::math::{
         Rng, Transform, Vec2, approach, lerp, noise1, noise2, random, random_int, random_normal,
         random_range, vec2,

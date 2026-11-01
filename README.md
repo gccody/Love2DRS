@@ -49,6 +49,11 @@ opt-level = 2
 Cargo only applies `[profile.*]` settings from your own `Cargo.toml`, not from a
 dependency's, so this has to go in your game's manifest. Rust 1.88 or newer is required.
 
+love2drs runs on Windows, macOS and Linux (X11 and Wayland). On Linux, building needs a few
+system headers: `sudo apt install pkg-config libudev-dev libasound2-dev` on Debian/Ubuntu, or
+`sudo dnf install pkgconf systemd-devel alsa-lib-devel` on Fedora. `libudev-dev` is for the
+`gamepad` feature and `libasound2-dev` for `audio`; drop either feature to skip its headers.
+
 | ![showcase](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/showcase.png) | ![starfall](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/starfall.png) |
 | ![platformer](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/platformer.png) | ![shaders](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/shaders.png) |
 
@@ -60,6 +65,7 @@ cargo run --example showcase                  # tour of the drawing API
 cargo run --release --example starfall        # arcade game: catch stars, dodge meteors
 cargo run --release --example platformer      # pixel-art platformer (canvas + sprite batch)
 cargo run --example shaders                   # custom WGSL pixel shaders / post effects
+cargo run --example input                     # gamepad / touch / event tester
 cargo run --release --example spritemark -- 100000   # renderer stress test
 ```
 
@@ -72,8 +78,11 @@ Every example generates its art and sound in code, so none of them need asset fi
 | `love.load` | the closure passed to `love2drs::run` |
 | `love.update(dt)` / `love.draw()` | `Game::update` / `Game::draw` |
 | `love.keypressed`, `mousepressed`, `textinput`, `wheelmoved`, `resize`, `focus`, `quit`, ... | `Game::key_pressed`, `mouse_pressed`, `text_input`, `wheel_moved`, `resize`, `focus`, `quit`, ... |
+| `love.gamepadpressed`, `gamepadaxis`, `joystickadded`, `touchpressed`, `touchmoved`, ... | `Game::gamepad_pressed`, `gamepad_axis`, `gamepad_added`, `touch_pressed`, `touch_moved`, ... |
 | `love.graphics` | `ctx.graphics`: shapes, images, quads, text, canvases, sprite batches, meshes, shaders, blend modes, scissor, transform stack, screenshots |
 | `love.keyboard` / `love.mouse` | `ctx.keyboard` / `ctx.mouse` (`is_down`, `was_pressed`, `axis`, position, wheel, grab, ...) |
+| `love.joystick` | `ctx.gamepad`: hot-plugged controllers in an Xbox-style layout (buttons, sticks, triggers, rumble) via [gilrs](https://crates.io/crates/gilrs) |
+| `love.touch` | `ctx.touch`: every finger on a touchscreen (position, start, delta, pressure) |
 | `love.audio` | `ctx.audio` (wav/ogg/mp3/flac, volume, pitch, looping, seek, overlapping SFX, synthesized sounds) |
 | `love.timer` | `ctx.timer` (`delta`, `fps`, `time`) |
 | `love.window` | `ctx.window` (title, size, fullscreen, ...) |
@@ -81,6 +90,9 @@ Every example generates its art and sound in code, so none of them need asset fi
 | `conf.lua` | `Conf::new("title").size(1280, 720).msaa(4).vsync(false)` |
 
 Some differences from LÖVE:
+
+- **A minimized game keeps running at 30 fps.** Nothing is drawn to the screen, but `update`,
+  input and audio carry on. Check `ctx.window.is_minimized()` to pause instead.
 
 - **Optional arguments become builders.** `love.graphics.draw(img, x, y, r, sx, sy, ox, oy)` is
   `g.draw_ex(&img, DrawParams::at(x, y).rotation(r).scale(2.0).centered())`. The plain
@@ -126,10 +138,23 @@ For geometry that doesn't move, a `SpriteBatch` avoids that cost entirely.
 | feature | default | |
 |---|---|---|
 | `audio` | yes | sound via [rodio](https://crates.io/crates/rodio) (wav, ogg vorbis, mp3, flac) |
+| `gamepad` | yes | controllers via [gilrs](https://crates.io/crates/gilrs); without it `ctx.gamepad` reports none |
 | `png` | yes | PNG decoding and screenshots |
 | `jpeg` | yes | JPEG decoding |
 
-`cargo build --no-default-features` gives you a graphics-only build.
+`cargo build --no-default-features` gives you a graphics-only build. Touch input needs no feature.
+
+### Platform notes for input
+
+- **Gamepads** work on Windows (Windows.Gaming.Input), macOS (IOKit) and Linux (evdev). Controller
+  input keeps arriving while the window is unfocused or minimized, so a button let go in the
+  background is never left stuck down. Check `ctx.window.has_focus()` if your game should ignore it.
+  Linux users need read access to `/dev/input/event*`, which desktop distributions grant to the
+  logged-in user.
+  Rumble works on Windows and Linux. macOS has no rumble API in gilrs, so `set_vibration` returns `false` there.
+- **Touch** events come from touchscreens on Windows and Linux. macOS has no touchscreens: trackpad
+  gestures arrive as mouse and wheel events, so `ctx.touch` stays empty there. The OS also sends
+  emulated mouse events for the first finger, so a tap reaches both `touch_pressed` and `mouse_pressed`.
 
 ## Screenshot testing
 
@@ -175,7 +200,7 @@ skills/love2drs/    agent skill (SKILL.md + API reference + recipes)
 
 ## Roadmap ideas
 
-Gamepad input (gilrs), streaming playback for long music tracks, stencil support, multiple render
+Android and iOS packaging, streaming playback for long music tracks, stencil support, multiple render
 targets, a retained `Text` object, a filesystem module that knows about the game's save directory, and
 WebAssembly support.
 

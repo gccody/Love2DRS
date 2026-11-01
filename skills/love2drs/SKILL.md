@@ -86,14 +86,18 @@ the load closure. To return your own errors use `Error::custom(msg)`.
 
 **The frame loop**, in order:
 1. OS events are delivered to the event callbacks (`key_pressed`, `mouse_pressed`, `text_input`,
-   `wheel_moved`, `resize`, `focus`, `file_dropped`, `quit`).
+   `wheel_moved`, `touch_pressed`/`touch_moved`/`touch_released`, `resize`, `focus`,
+   `file_dropped`, `quit`), then controller events (`gamepad_added`/`removed`,
+   `gamepad_pressed`/`released`, `gamepad_axis`).
 2. `update(ctx, dt)` runs. `dt` is in seconds and clamped to `Conf::max_dt` (0.25 by default).
-3. Per-frame input edges are cleared: `was_pressed`, `was_released`, `mouse.delta()` and `mouse.wheel()`.
+3. Per-frame input edges are cleared: `was_pressed`, `was_released`, `mouse.delta()`, `mouse.wheel()`,
+   touch deltas and `ctx.touch.released()`.
 4. The screen is cleared to the background color, the transform is reset, and `draw(ctx)` runs.
-5. The frame is submitted and presented (vsync on by default).
+5. The frame is submitted and presented (vsync on by default). While the window is minimized
+   the loop keeps running, capped at 30 fps (`ctx.window.is_minimized()` to pause).
 
-**`Context`** has public fields: `ctx.graphics`, `ctx.keyboard`, `ctx.mouse`, `ctx.timer`,
-`ctx.window` and `ctx.audio` (audio feature only). Use `ctx.quit()` to exit. `Game::quit` can veto
+**`Context`** has public fields: `ctx.graphics`, `ctx.keyboard`, `ctx.mouse`, `ctx.gamepad`,
+`ctx.touch`, `ctx.timer`, `ctx.window` and `ctx.audio` (audio feature only). Use `ctx.quit()` to exit. `Game::quit` can veto
 the exit by returning `true`.
 
 **Drawing is stateful like LÖVE.** `set_color`, `set_font`, `set_line_width`, `set_blend_mode`,
@@ -122,7 +126,7 @@ thousands. Check `g.stats().draw_calls`.
 
 ## Gotchas (read before writing code)
 
-- **The prelude covers almost everything**, including `Graphics`, `Keyboard`, `Mouse`, `Audio`,
+- **The prelude covers almost everything**, including `Graphics`, `Keyboard`, `Mouse`, `Gamepads`, `Touch`, `Audio`,
   `Rng`, `approach` and `noise2`, so helpers like `fn draw_hud(g: &mut Graphics)` need no
   extra imports. The few exceptions (`Timer`, `Window`, `FrameStats`, `set_random_seed`, ...)
   are listed at the top of `references/api.md`.
@@ -133,6 +137,16 @@ thousands. Check `g.stats().draw_calls`.
   `Key::Num0..Num9`, keypad keys are `Key::Kp0..`, and modifiers are `LShift`/`RShift`/`LCtrl`/... (`kb.shift()`
   checks either). For typed characters, implement `text_input` instead of mapping keys.
   `key_pressed` auto-repeat is off until `ctx.keyboard.set_key_repeat(true)`.
+- **Gamepads use an Xbox layout.** `GamepadButton::A` is the bottom face button on every
+  controller. `ctx.gamepad.is_down(b)`, `left_stick()`, `dpad()` and `axis(a)` read *any*
+  connected controller, which suits single-player games. For local multiplayer, keep each
+  player's `GamepadId` (from `gamepad_added`) and use `ctx.gamepad.get(id)`. Stick `y` points
+  down like the screen, so `pos += ctx.gamepad.left_stick() * speed * dt` just works. Combine
+  with the keyboard: `(keys + ctx.gamepad.left_stick()).clamp_length_max(1.0)`. A small dead
+  zone is already applied. Rumble with `ctx.gamepad.set_vibration(id, left, right, seconds)`.
+- **Touch** is `ctx.touch.touches()` (each with `position`, `start`, `delta`, `pressure`) plus the
+  `touch_*` callbacks. The OS also turns the first finger into emulated mouse events, so don't
+  handle the same action in both `touch_pressed` and `mouse_pressed`. macOS has no touch events.
 - **Borrowing `ctx`.** `let g = &mut ctx.graphics;` borrows only that field, so reading
   `ctx.timer`, `ctx.mouse` or `ctx.keyboard` while `g` is alive is fine. Calling a method on
   `ctx` itself (`ctx.quit()`) is not. Read values first, or end the borrow.
@@ -161,8 +175,8 @@ thousands. Check `g.stats().draw_calls`.
   nothing. Use `play_overlapping()` for sound effects that can overlap. Files are fully decoded
   into memory (no streaming), so very long music costs RAM. With no audio device the game still
   runs and sound is silent.
-- **No built-in** physics, ECS, scene graph, gamepad, filesystem or save-dir module, networking,
-  or WASM. Use plain Rust (`std::fs`, `include_bytes!`, your own structs) or other crates.
+- **No built-in** physics, ECS, scene graph, filesystem or save-dir module, networking,
+  Android/iOS packaging, or WASM. Use plain Rust (`std::fs`, `include_bytes!`, your own structs) or other crates.
   `love2drs::run` can only be called once per process.
 - **Assets**: relative paths resolve against the *current working directory*, which is the
   directory you run `cargo run` from. That is usually the package root, not `src/`. To ship a
@@ -191,6 +205,12 @@ thousands. Check `g.stats().draw_calls`.
 | `love.graphics.newShader(glsl)` | `g.new_shader(wgsl_effect)?` (WGSL, not GLSL) |
 | `love.keyboard.isDown("a", "left")` | `ctx.keyboard.is_any_down(&[Key::A, Key::Left])` |
 | `love.mouse.getPosition()` | `ctx.mouse.position()` (a `Vec2`) |
+| `love.gamepadpressed(joystick, button)` | `Game::gamepad_pressed(ctx, id, button)` |
+| `joystick:isGamepadDown("a")` | `ctx.gamepad.get(id)` then `pad.is_down(GamepadButton::A)`, or `ctx.gamepad.is_down(GamepadButton::A)` for any pad |
+| `joystick:getGamepadAxis("leftx")` | `pad.axis(GamepadAxis::LeftX)` / `pad.left_stick()` |
+| `joystick:setVibration(l, r, d)` | `ctx.gamepad.set_vibration(id, l, r, d)` |
+| `love.touchpressed(id, x, y, ...)` | `Game::touch_pressed(ctx, id, x, y)` |
+| `love.touch.getTouches()` | `ctx.touch.touches()` |
 | `love.audio.newSource(path, "static")` | `ctx.audio.new_source(path)?` |
 | `love.timer.getFPS()` | `ctx.timer.fps()` |
 | `love.math.random(a, b)` | `random_int(a, b)` (inclusive). `random_range(a, b)` for floats |

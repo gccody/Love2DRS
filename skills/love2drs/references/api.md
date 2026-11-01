@@ -3,12 +3,13 @@
 Everything below is public API. `use love2drs::prelude::*;` brings in:
 
 - core: `Game`, `Context`, `Conf`, `Error`, `Result`
-- module types (for helper function signatures): `Graphics`, `Keyboard`, `Mouse`, and `Audio`
-  (audio feature)
+- module types (for helper function signatures): `Graphics`, `Keyboard`, `Mouse`, `Gamepads`,
+  `Touch`, and `Audio` (audio feature)
 - graphics: `DrawMode` (+ `Fill`, `Line`), `Align`, `BlendMode`, `Canvas`, `Color`, `DrawParams`,
   `Drawable`, `FilterMode`, `Font`, `Image`, `ImageData`, `Quad`, `Shader`, `SpriteBatch`,
   `Vertex`, `WrapMode`
-- input: `Key`, `MouseButton`
+- input: `Key`, `MouseButton`, `Gamepad`, `GamepadId`, `GamepadButton`, `GamepadAxis`, `TouchId`,
+  `TouchPoint`
 - math: `Vec2`, `vec2`, `Transform`, `Rng`, `lerp`, `approach`, `noise1`, `noise2`, `random`,
   `random_int`, `random_range`, `random_normal`
 - audio (audio feature): `SoundData`, `Source`
@@ -61,6 +62,14 @@ fn mouse_pressed(&mut self, ctx: &mut Context, x: f32, y: f32, button: MouseButt
 fn mouse_released(&mut self, ctx: &mut Context, x: f32, y: f32, button: MouseButton)
 fn mouse_moved(&mut self, ctx: &mut Context, x: f32, y: f32, dx: f32, dy: f32)
 fn wheel_moved(&mut self, ctx: &mut Context, x: f32, y: f32)   // y > 0 = away from user
+fn touch_pressed(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32)
+fn touch_moved(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32, dx: f32, dy: f32)
+fn touch_released(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32) // also on cancel
+fn gamepad_added(&mut self, ctx: &mut Context, id: GamepadId)  // also for pads present at startup
+fn gamepad_removed(&mut self, ctx: &mut Context, id: GamepadId)
+fn gamepad_pressed(&mut self, ctx: &mut Context, id: GamepadId, button: GamepadButton)
+fn gamepad_released(&mut self, ctx: &mut Context, id: GamepadId, button: GamepadButton)
+fn gamepad_axis(&mut self, ctx: &mut Context, id: GamepadId, axis: GamepadAxis, value: f32)
 fn resize(&mut self, ctx: &mut Context, width: f32, height: f32) // logical pixels
 fn focus(&mut self, ctx: &mut Context, focused: bool)
 fn file_dropped(&mut self, ctx: &mut Context, path: std::path::PathBuf)
@@ -74,6 +83,7 @@ The trait requires `'static`, so your game struct must own its data (no borrowed
 ```rust
 pub struct Context {
     pub graphics: Graphics, pub keyboard: Keyboard, pub mouse: Mouse,
+    pub gamepad: Gamepads, pub touch: Touch,
     pub timer: Timer, pub window: Window,
     pub audio: Audio,          // only with the `audio` feature
 }
@@ -314,6 +324,43 @@ is_inside()  set_visible(bool) is_visible()  set_grabbed(bool) is_grabbed()  set
 ```
 `MouseButton::{Left, Right, Middle, Back, Forward, Other(u16)}`.
 
+## Gamepads (`ctx.gamepad`, feature `gamepad`)
+
+Without the feature (or on a platform with no backend) everything reports no controllers.
+
+```rust
+count() -> usize   is_connected() -> bool                 // any controller plugged in
+iter() -> impl Iterator<Item = &Gamepad>   ids() -> impl Iterator<Item = GamepadId>
+get(GamepadId) -> Option<&Gamepad>   first() -> Option<&Gamepad>   // first = connected longest
+// "any controller" shortcuts, good for single-player:
+is_down(GamepadButton)  is_any_down(&[GamepadButton])  was_pressed(..)  was_released(..)
+axis(GamepadAxis) -> f32  left_stick() right_stick() dpad() -> Vec2  // strongest across pads
+set_vibration(id, left: f32, right: f32, seconds: f32) -> bool   // 0..1 motors; f32::INFINITY = until stopped
+stop_vibration(id)
+```
+`Gamepad` (one controller): `id() name() is_down(b) is_any_down(&[b]) was_pressed(b)
+was_released(b) axis(a) left_stick() right_stick() dpad() is_vibration_supported()`.
+
+`GamepadButton` (Xbox names; `A` = bottom face button on every pad): `A B X Y Back Guide Start
+LeftStick RightStick LeftShoulder RightShoulder LeftTrigger RightTrigger DPadUp DPadDown DPadLeft
+DPadRight`. `GamepadAxis`: `LeftX LeftY RightX RightY` (-1..1, **y down**) and `LeftTrigger
+RightTrigger` (0..1). Both have `ALL` and `name()` (LÖVE names, e.g. `"dpup"`, `"triggerleft"`).
+`GamepadId::index()` gives a `usize`. Stick values have a dead zone applied already. Controller
+input keeps arriving while the window is unfocused or minimized; macOS has no rumble.
+
+## Touch (`ctx.touch`)
+
+```rust
+touches() -> &[TouchPoint]   count() -> usize            // fingers on screen, oldest first
+get(TouchId) -> Option<&TouchPoint>   position(TouchId) -> Option<Vec2>
+was_pressed(TouchId) -> bool   pressed() -> impl Iterator<Item = &TouchPoint>   // this frame
+released() -> &[TouchPoint]                              // lifted this frame, last position
+```
+`TouchPoint { id: TouchId, position: Vec2, start: Vec2, delta: Vec2, pressure: f32 }` (logical
+px; `delta` since last frame; `pressure` 0..1, 1 when unsupported). `TouchId::index()` gives a
+`u64`. A tap is a released point whose `position` is close to `start`. Touchscreens work on
+Windows and Linux; the first finger also produces emulated mouse events.
+
 ## Timer (`ctx.timer`)
 
 ```rust
@@ -325,8 +372,9 @@ delta() -> f32   fps() -> f32   average_delta() -> f32   time() -> f64   frame_c
 ```rust
 title() set_title(impl Into<String>)  size() -> (f32, f32)  set_size(w: u32, h: u32)
 scale_factor() -> f64  set_fullscreen(bool) is_fullscreen()  set_resizable(bool)
-has_focus()  minimize()  maximize()  winit() -> &winit::window::Window
+has_focus()  minimize()  is_minimized()  maximize()  winit() -> &winit::window::Window
 ```
+While minimized the game keeps running, capped at 30 fps.
 
 ## Audio (`ctx.audio`, feature `audio`)
 

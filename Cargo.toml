@@ -14,9 +14,12 @@ categories = ["game-engines", "graphics", "rendering"]
 exclude = ["/assets/icon.svg", "/screenshots", "/skills", "/.claude-plugin"]
 
 [features]
-default = ["audio", "png", "jpeg"]
+default = ["audio", "gamepad", "png", "jpeg"]
 ## Sound playback via rodio (wav, ogg/vorbis, mp3, flac).
 audio = ["dep:rodio"]
+## Gamepad input via gilrs. On Linux, building it needs the libudev headers
+## (`libudev-dev` on Debian/Ubuntu, `systemd-devel` on Fedora).
+gamepad = ["dep:gilrs"]
 ## PNG decoding for `Graphics::new_image`.
 png = ["image/png"]
 ## JPEG decoding for `Graphics::new_image`.
@@ -31,6 +34,7 @@ pollster = "0.4"
 ab_glyph = "0.2"
 log = "0.4"
 image = { version = "0.25", default-features = false }
+gilrs = { version = "0.11", optional = true }
 rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "vorbis", "mp3", "flac"], optional = true }
 
 # Dependencies (wgpu, image decoding, audio) are compiled with optimizations even in

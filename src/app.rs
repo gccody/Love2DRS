@@ -1,13 +1,18 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 use crate::graphics::Graphics;
-use crate::input::{Key, Keyboard, Mouse, MouseButton};
+use crate::input::gamepad::GamepadEvent;
+use crate::input::{
+    GamepadAxis, GamepadButton, GamepadId, Gamepads, Key, Keyboard, Mouse, MouseButton, Touch,
+    TouchId,
+};
 use crate::math::vec2;
 use crate::timer::Timer;
 use crate::window::Window;
@@ -21,6 +26,10 @@ pub struct Context {
     pub keyboard: Keyboard,
     /// Mouse state and cursor control (`love.mouse`).
     pub mouse: Mouse,
+    /// Connected controllers and rumble (`love.joystick`).
+    pub gamepad: Gamepads,
+    /// Fingers on a touchscreen (`love.touch`).
+    pub touch: Touch,
     /// Frame timing (`love.timer`).
     pub timer: Timer,
     /// The game window (`love.window`).
@@ -72,6 +81,34 @@ pub trait Game: 'static {
     /// Mouse wheel movement; `y > 0` scrolls away from the user.
     fn wheel_moved(&mut self, ctx: &mut Context, x: f32, y: f32) {}
 
+    /// A finger touched the screen at `(x, y)` in logical pixels. Pressure and
+    /// other details are in `ctx.touch.get(id)`.
+    fn touch_pressed(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32) {}
+
+    /// A finger moved to `(x, y)`; `(dx, dy)` is the movement since the last event.
+    fn touch_moved(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32, dx: f32, dy: f32) {}
+
+    /// A finger left the screen at `(x, y)`. Also sent when the OS cancels a
+    /// touch, for example when a system gesture takes over.
+    fn touch_released(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32) {}
+
+    /// A controller was connected. Controllers already plugged in at startup
+    /// are announced before the first `update`.
+    fn gamepad_added(&mut self, ctx: &mut Context, id: GamepadId) {}
+
+    /// A controller was disconnected. It is already gone from `ctx.gamepad`.
+    fn gamepad_removed(&mut self, ctx: &mut Context, id: GamepadId) {}
+
+    /// A controller button went down.
+    fn gamepad_pressed(&mut self, ctx: &mut Context, id: GamepadId, button: GamepadButton) {}
+
+    /// A controller button was released.
+    fn gamepad_released(&mut self, ctx: &mut Context, id: GamepadId, button: GamepadButton) {}
+
+    /// A stick or trigger moved to `value` (-1..1 for sticks with `y` down,
+    /// 0..1 for triggers).
+    fn gamepad_axis(&mut self, ctx: &mut Context, id: GamepadId, axis: GamepadAxis, value: f32) {}
+
     /// The window was resized (logical pixels).
     fn resize(&mut self, ctx: &mut Context, width: f32, height: f32) {}
 
@@ -122,6 +159,7 @@ where
         state: None,
         error: None,
         autoshot: AutoShot::from_env(),
+        last_frame: Instant::now(),
     };
     event_loop
         .run_app(&mut app)
@@ -132,7 +170,29 @@ where
     }
 }
 
-/// Testing aid: `LOVE2DRS_SCREENSHOT=out.png` saves frame
+/// Reads controller events and replays them as `Game` callbacks.
+fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) {
+    ctx.gamepad.poll();
+    if ctx.gamepad.events.is_empty() {
+        return;
+    }
+    let mut events = std::mem::take(&mut ctx.gamepad.events);
+    for ev in events.drain(..) {
+        match ev {
+            GamepadEvent::Added(id) => game.gamepad_added(ctx, id),
+            GamepadEvent::Removed(id) => game.gamepad_removed(ctx, id),
+            GamepadEvent::Pressed(id, b) => game.gamepad_pressed(ctx, id, b),
+            GamepadEvent::Released(id, b) => game.gamepad_released(ctx, id, b),
+            GamepadEvent::Axis(id, a, v) => game.gamepad_axis(ctx, id, a, v),
+        }
+    }
+    // Hand the (now empty) buffer back so its allocation is reused.
+    if ctx.gamepad.events.is_empty() {
+        ctx.gamepad.events = events;
+    }
+}
+
+/// Testing aid:`LOVE2DRS_SCREENSHOT=out.png` saves frame
 /// `LOVE2DRS_SCREENSHOT_FRAME` (default 60) and exits. Useful for CI smoke tests.
 struct AutoShot {
     path: Option<String>,
@@ -159,7 +219,11 @@ struct App<G, F> {
     state: Option<(Context, G)>,
     error: Option<Error>,
     autoshot: AutoShot,
+    last_frame: Instant,
 }
+
+/// Frame interval while the window is minimized (30 fps).
+const MINIMIZED_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 impl<G, F> App<G, F>
 where
@@ -189,6 +253,8 @@ where
             graphics,
             keyboard: Keyboard::new(),
             mouse: Mouse::new(window.clone()),
+            gamepad: Gamepads::new(),
+            touch: Touch::new(),
             timer: Timer::new(conf.max_dt),
             window: Window::new(window.clone(), conf.title.clone()),
             #[cfg(feature = "audio")]
@@ -206,10 +272,14 @@ where
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
+        self.last_frame = Instant::now();
+        poll_gamepads(ctx, game);
         let dt = ctx.timer.step();
         game.update(ctx, dt);
         ctx.keyboard.end_frame();
         ctx.mouse.end_frame();
+        ctx.gamepad.end_frame();
+        ctx.touch.end_frame();
 
         ctx.graphics.begin_frame();
         game.draw(ctx);
@@ -277,6 +347,7 @@ where
                 if !focused {
                     ctx.keyboard.release_all();
                     ctx.mouse.release_all();
+                    ctx.touch.release_all();
                 }
                 game.focus(ctx, focused);
             }
@@ -333,6 +404,29 @@ where
                 ctx.mouse.scrolled(vec2(x, y));
                 game.wheel_moved(ctx, x, y);
             }
+            WindowEvent::Touch(touch) => {
+                let p = touch
+                    .location
+                    .to_logical::<f32>(ctx.window.inner.scale_factor());
+                let pressure = touch.force.map_or(1.0, |f| f.normalized() as f32);
+                let id = TouchId(touch.id);
+                match touch.phase {
+                    TouchPhase::Started => {
+                        ctx.touch.begin(id, vec2(p.x, p.y), pressure);
+                        game.touch_pressed(ctx, id, p.x, p.y);
+                    }
+                    TouchPhase::Moved => {
+                        if let Some(d) = ctx.touch.moved(id, vec2(p.x, p.y), pressure) {
+                            game.touch_moved(ctx, id, p.x, p.y, d.x, d.y);
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        if ctx.touch.end(id, vec2(p.x, p.y), pressure) {
+                            game.touch_released(ctx, id, p.x, p.y);
+                        }
+                    }
+                }
+            }
             WindowEvent::DroppedFile(path) => game.file_dropped(ctx, path),
             _ => {}
         }
@@ -344,9 +438,20 @@ where
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some((ctx, _)) = &self.state {
-            ctx.window.inner.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some((ctx, _)) = &self.state else {
+            return;
+        };
+        // Nothing is presented while minimized, so vsync no longer paces the
+        // loop. Keep the game running, but at a capped rate.
+        if ctx.window.is_minimized() {
+            let next = self.last_frame + MINIMIZED_FRAME_TIME;
+            if Instant::now() < next {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                return;
+            }
         }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        ctx.window.inner.request_redraw();
     }
 }
