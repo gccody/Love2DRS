@@ -81,9 +81,12 @@ Some differences from LÖVE:
 
 Draw calls are never sent to the GPU directly:
 
-- Each frame's geometry goes into one CPU vertex/index buffer. Consecutive draws that share a
-  texture, blend mode, shader and scissor are merged into a single GPU draw call. At the end of the frame
-  everything is uploaded with one `write_buffer` per buffer.
+- Sprites, glyphs and shapes are recorded as 48-byte quad/triangle instances that the vertex shader
+  expands, instead of four vertices plus six indices (104 bytes). Consecutive draws that share a
+  texture, blend mode, shader and scissor are merged into a single GPU draw call. At the end of the
+  frame everything is uploaded with one `write_buffer` per buffer.
+- Drawing with the same texture as the previous draw costs one comparison and a `Vec` push; state
+  changes are handled on a separate slow path.
 - Shapes sample a white texel inside the glyph atlas, so rectangles, circles and text **batch together**.
 - All text, in any font and size, shares one glyph atlas that is rasterized on demand.
 - `SpriteBatch` keeps static geometry (tile maps) on the GPU between frames. It is only re-uploaded when
@@ -95,11 +98,12 @@ development machine (release build, vsync off):
 
 | sprites | fps | GPU draw calls |
 |---:|---:|---:|
-| 30,000 | ~630 | 2 |
-| 100,000 | ~185 | 2 |
-| 200,000 | ~95 | 2 |
+| 30,000 | ~1,100 | 2 |
+| 100,000 | ~375 | 2 |
+| 200,000 | ~190 | 2 |
 
-At these counts the time goes mostly to memory bandwidth for the vertices (about 100 bytes per sprite).
+At 100,000 sprites a frame is roughly 1.5 ms of recording the draws, 0.8 ms of uploading the
+instances (48 bytes per sprite) and 0.25 ms of the example's own update loop.
 For geometry that doesn't move, a `SpriteBatch` avoids that cost entirely.
 
 ## Cargo features

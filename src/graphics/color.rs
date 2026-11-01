@@ -87,9 +87,15 @@ impl Color {
     /// Packed 8-bit representation used for vertices.
     #[inline]
     pub fn to_rgba8(self) -> [u8; 4] {
-        #[inline]
+        #[inline(always)]
+        #[allow(clippy::manual_clamp)] // `clamp` keeps NaN, which the cast must not see
         fn c(v: f32) -> u8 {
-            (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+            // Unlike `clamp`, `max`/`min` turn NaN into 0, so `v` is always in
+            // [0.5, 255.5] and the unchecked cast (no saturation fix-ups, so
+            // it vectorizes) is sound.
+            let v = v.max(0.0).min(1.0) * 255.0 + 0.5;
+            // SAFETY: `v` is finite and truncates to 0..=255.
+            unsafe { v.to_int_unchecked::<u8>() }
         }
         [c(self.r), c(self.g), c(self.b), c(self.a)]
     }
@@ -135,5 +141,23 @@ impl From<[f32; 4]> for Color {
 impl From<Color> for [f32; 4] {
     fn from(c: Color) -> Self {
         [c.r, c.g, c.b, c.a]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_rgba8_rounds_and_saturates() {
+        assert_eq!(
+            Color::rgba(0.0, 1.0, 0.5, 0.2).to_rgba8(),
+            [0, 255, 128, 51]
+        );
+        assert_eq!(
+            Color::rgba(-3.0, 7.0, f32::INFINITY, f32::NEG_INFINITY).to_rgba8(),
+            [0, 255, 255, 0]
+        );
+        assert_eq!(Color::rgba(f32::NAN, 1.0, 1.0, 1.0).to_rgba8()[0], 0);
     }
 }

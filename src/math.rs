@@ -188,15 +188,20 @@ impl Transform {
 #[inline]
 pub fn sin_cos(x: f32) -> (f32, f32) {
     // Range-reduce in f64 so large accumulated angles stay accurate.
+    // Adding 1.5 * 2^52 rounds to the nearest integer without a libm call
+    // (`f64::round` is a function call on baseline x86-64), and the low
+    // mantissa bits of the sum are that integer modulo 4: the quadrant.
+    const ROUND: f64 = 6_755_399_441_055_744.0;
     let xd = x as f64;
-    let q = (xd * std::f64::consts::FRAC_2_PI).round();
+    let shifted = xd * std::f64::consts::FRAC_2_PI + ROUND;
+    let q = shifted - ROUND;
     let r = (xd - q * std::f64::consts::FRAC_PI_2) as f32;
     let r2 = r * r;
     // Cephes minimax polynomials on [-pi/4, pi/4].
     let s = r + r * r2 * (-1.666_665_5e-1 + r2 * (8.332_161e-3 + r2 * -1.951_529_6e-4));
     let c =
         1.0 - 0.5 * r2 + r2 * r2 * (4.166_664_6e-2 + r2 * (-1.388_731_6e-3 + r2 * 2.443_315_7e-5));
-    match (q as i64) & 3 {
+    match shifted.to_bits() & 3 {
         0 => (s, c),
         1 => (c, -s),
         2 => (-s, -c),

@@ -37,6 +37,33 @@ fn vs_main(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2)
     return out;
 }
 
+// Instanced quads: corners p0 (uv0), p1 (u1, v0), p2 (u0, v1) and p1 + p2 - p0.
+// kind 1 is a triangle (p0, p1, p2); its second half collapses to a point.
+@vertex
+fn vs_quad(
+    @builtin(vertex_index) vi: u32,
+    @location(0) p0: vec2<f32>,
+    @location(1) p1: vec2<f32>,
+    @location(2) p2: vec2<f32>,
+    @location(3) uv: vec4<f32>,
+    @location(4) color: vec4<f32>,
+    @location(5) kind: u32,
+) -> VsOut {
+    // Two triangles: (0,0) (1,0) (1,1) / (0,0) (1,1) (0,1).
+    var cx = select(0.0, 1.0, vi == 1u || vi == 2u || vi == 4u);
+    var cy = select(0.0, 1.0, vi == 2u || vi == 4u || vi == 5u);
+    if kind != 0u {
+        cx = select(0.0, 1.0, vi == 1u);
+        cy = select(0.0, 1.0, vi == 2u);
+    }
+    let pos = p0 + cx * (p1 - p0) + cy * (p2 - p0);
+    var out: VsOut;
+    out.position = globals.transform * vec4<f32>(pos, 0.0, 1.0);
+    out.uv = mix(uv.xy, uv.zw, vec2<f32>(cx, cy));
+    out.color = color * globals.tint;
+    return out;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return effect(in.color, tex, samp, in.uv, in.position.xy);

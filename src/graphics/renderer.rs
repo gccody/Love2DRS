@@ -1,10 +1,12 @@
 //! Frame recording structures and the wgpu backend that executes them.
 //!
 //! Draw calls made through [`Graphics`](super::Graphics) never touch the GPU
-//! directly. Geometry is appended to one big CPU vertex/index buffer and
-//! consecutive draws sharing a texture + state are merged into a single
-//! [`DrawCmd`]. At the end of the frame everything is uploaded with one
-//! `write_buffer` per buffer and replayed in as few render passes as possible.
+//! directly. Sprites, glyphs and shapes are appended to one CPU array of
+//! [`QuadInstance`]s (48 bytes each, expanded to corners by the vertex shader)
+//! and consecutive draws sharing a texture + state are merged into a single
+//! [`DrawCmd`]. Only user meshes use a classic vertex/index buffer. At the end
+//! of the frame everything is uploaded with one `write_buffer` per buffer and
+//! replayed in as few render passes as possible.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,14 +98,76 @@ impl BlendMode {
     }
 }
 
+/// One textured quad (or, with `kind == TRIANGLE_KIND`, one triangle) of
+/// immediate-mode geometry. The vertex shader expands it into its corners, so a
+/// sprite costs 48 bytes of upload instead of four vertices plus six indices
+/// (104 bytes).
+///
+/// For a quad, `p0`, `p1` and `p2` are the corners at uv `(u0, v0)`,
+/// `(u1, v0)` and `(u0, v1)`; the fourth corner is `p1 + p2 - p0` (an affine
+/// transform of a rectangle is always a parallelogram). For a triangle they are
+/// its three corners and it samples the texel at `(u0, v0)`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct QuadInstance {
+    pub p0: [f32; 2],
+    pub p1: [f32; 2],
+    pub p2: [f32; 2],
+    pub uv: [f32; 4],
+    pub color: [u8; 4],
+    pub kind: u32,
+}
+
+pub(crate) const QUAD_KIND: u32 = 0;
+pub(crate) const TRIANGLE_KIND: u32 = 1;
+const INSTANCE_SIZE: u64 = std::mem::size_of::<QuadInstance>() as u64;
+
+impl QuadInstance {
+    /// A solid triangle sampling the texel at `uv`.
+    #[inline(always)]
+    pub fn triangle(
+        p0: [f32; 2],
+        p1: [f32; 2],
+        p2: [f32; 2],
+        uv: [f32; 2],
+        color: [u8; 4],
+    ) -> Self {
+        QuadInstance {
+            p0,
+            p1,
+            p2,
+            uv: [uv[0], uv[1], uv[0], uv[1]],
+            color,
+            kind: TRIANGLE_KIND,
+        }
+    }
+}
+
+/// Which pipeline (vertex layout) a command uses.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum GeomKind {
+    /// Instanced [`QuadInstance`]s.
+    Quads,
+    /// Indexed [`Vertex`] triangles (`Graphics::mesh`).
+    Mesh,
+}
+
 pub(crate) enum Geometry {
-    /// Indices into this frame's shared vertex/index buffers.
-    Frame,
-    /// A retained buffer pair owned by a `SpriteBatch`.
-    Retained {
-        vertices: Arc<wgpu::Buffer>,
-        indices: Arc<wgpu::Buffer>,
-    },
+    /// A range of this frame's shared quad instances.
+    Quads,
+    /// A range of this frame's shared mesh index buffer.
+    Mesh,
+    /// Quad instances retained in a buffer owned by a `SpriteBatch`.
+    Retained { instances: Arc<wgpu::Buffer> },
+}
+
+impl Geometry {
+    fn kind(&self) -> GeomKind {
+        match self {
+            Geometry::Mesh => GeomKind::Mesh,
+            Geometry::Quads | Geometry::Retained { .. } => GeomKind::Quads,
+        }
+    }
 }
 
 pub(crate) struct DrawCmd {
@@ -111,8 +175,9 @@ pub(crate) struct DrawCmd {
     pub blend: BlendMode,
     pub texture: Arc<wgpu::BindGroup>,
     pub geometry: Geometry,
-    pub index_start: u32,
-    pub index_end: u32,
+    /// Range of quad instances (quads, sprite batches) or indices (meshes).
+    pub start: u32,
+    pub end: u32,
     /// Physical pixel scissor rectangle (unclamped).
     pub scissor: Option<[i32; 4]>,
     pub globals_offset: u32,
@@ -128,6 +193,9 @@ pub(crate) struct Pass {
 
 #[derive(Default)]
 pub(crate) struct FrameData {
+    pub quads: Vec<QuadInstance>,
+    /// How many `quads` entries are triangles (only used for stats).
+    pub triangle_instances: u32,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub uniforms: Vec<u8>,
@@ -137,11 +205,29 @@ pub(crate) struct FrameData {
 
 impl FrameData {
     pub fn reset(&mut self) {
+        self.quads.clear();
+        self.triangle_instances = 0;
         self.vertices.clear();
         self.indices.clear();
         self.uniforms.clear();
         self.passes.clear();
         self.cmds.clear();
+    }
+
+    /// Records where the command that is still accumulating frame geometry
+    /// (always the last one) ends. Draws only append, so this is deferred
+    /// until a new command starts or the frame is rendered.
+    #[inline]
+    pub fn close_cmd(&mut self) {
+        let quads = self.quads.len() as u32;
+        let indices = self.indices.len() as u32;
+        if let Some(cmd) = self.cmds.last_mut() {
+            match cmd.geometry {
+                Geometry::Quads => cmd.end = quads,
+                Geometry::Mesh => cmd.end = indices,
+                Geometry::Retained { .. } => {}
+            }
+        }
     }
 }
 
@@ -162,6 +248,7 @@ struct PipelineKey {
     blend: BlendMode,
     format: wgpu::TextureFormat,
     samples: u32,
+    kind: GeomKind,
 }
 
 /// Where the window's pixels go this frame.
@@ -179,7 +266,8 @@ pub struct FrameStats {
     pub draw_calls: u32,
     /// Render passes (screen + canvas switches) last frame.
     pub passes: u32,
-    /// Vertices generated on the CPU last frame (excludes sprite batches).
+    /// Vertices generated on the CPU last frame, excluding sprite batches
+    /// (a sprite, glyph or rectangle counts as four).
     pub vertices: u32,
     /// Triangles submitted last frame (including sprite batches).
     pub triangles: u32,
@@ -234,6 +322,7 @@ pub(crate) struct Renderer {
     pipeline_layout: wgpu::PipelineLayout,
     default_module: wgpu::ShaderModule,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline, FxBuild>,
+    instance_buffer: GrowBuffer,
     vertex_buffer: GrowBuffer,
     index_buffer: GrowBuffer,
     uniform_buffer: GrowBuffer,
@@ -279,17 +368,23 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(format!("{PRELUDE}\n{DEFAULT_EFFECT}").into()),
         });
         let uniform_align = device.limits().min_uniform_buffer_offset_alignment.max(256);
-        let vertex_buffer = GrowBuffer::new(
+        let instance_buffer = GrowBuffer::new(
             device,
-            "love2drs vertices",
+            "love2drs quads",
             wgpu::BufferUsages::VERTEX,
             1 << 20,
         );
+        let vertex_buffer = GrowBuffer::new(
+            device,
+            "love2drs mesh vertices",
+            wgpu::BufferUsages::VERTEX,
+            1 << 16,
+        );
         let index_buffer = GrowBuffer::new(
             device,
-            "love2drs indices",
+            "love2drs mesh indices",
             wgpu::BufferUsages::INDEX,
-            1 << 19,
+            1 << 16,
         );
         let uniform_buffer = GrowBuffer::new(
             device,
@@ -305,6 +400,7 @@ impl Renderer {
             pipeline_layout,
             default_module,
             pipelines: HashMap::default(),
+            instance_buffer,
             vertex_buffer,
             index_buffer,
             uniform_buffer,
@@ -353,39 +449,60 @@ impl Renderer {
             return;
         }
         let module = shader.map(|s| &s.module).unwrap_or(&self.default_module);
-        let pipeline = self.gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("love2drs pipeline"),
-            layout: Some(&self.pipeline_layout),
-            vertex: wgpu::VertexState {
-                module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
+        let (entry_point, layout) = match key.kind {
+            GeomKind::Quads => (
+                "vs_quad",
+                wgpu::VertexBufferLayout {
+                    array_stride: INSTANCE_SIZE,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &QUAD_ATTRIBUTES,
+                },
+            ),
+            GeomKind::Mesh => (
+                "vs_main",
+                wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4],
-                })],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState { count: key.samples, mask: !0, alpha_to_coverage_enabled: false },
-            fragment: Some(wgpu::FragmentState {
-                module,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: key.format,
-                    blend: key.blend.to_wgpu(),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+                    attributes: &MESH_ATTRIBUTES,
+                },
+            ),
+        };
+        let pipeline = self
+            .gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("love2drs pipeline"),
+                layout: Some(&self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(layout)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: key.samples,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.format,
+                        blend: key.blend.to_wgpu(),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
         self.pipelines.insert(key, pipeline);
     }
 
@@ -397,13 +514,16 @@ impl Renderer {
         format: wgpu::TextureFormat,
         samples: u32,
     ) {
-        let key = PipelineKey {
-            shader: shader.id,
-            blend: BlendMode::Alpha,
-            format,
-            samples,
-        };
-        self.ensure_pipeline(key, Some(shader));
+        for kind in [GeomKind::Quads, GeomKind::Mesh] {
+            let key = PipelineKey {
+                shader: shader.id,
+                blend: BlendMode::Alpha,
+                format,
+                samples,
+                kind,
+            };
+            self.ensure_pipeline(key, Some(shader));
+        }
     }
 
     /// Uploads the frame and records every pass into `encoder`.
@@ -414,10 +534,13 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
     ) -> FrameStats {
         let mut stats = FrameStats {
-            vertices: frame.vertices.len() as u32,
+            vertices: frame.vertices.len() as u32 + frame.quads.len() as u32 * 4
+                - frame.triangle_instances,
             ..Default::default()
         };
 
+        self.instance_buffer
+            .upload(&self.gpu, bytemuck::cast_slice(&frame.quads));
         self.vertex_buffer
             .upload(&self.gpu, bytemuck::cast_slice(&frame.vertices));
         self.index_buffer
@@ -456,6 +579,7 @@ impl Renderer {
                     blend: cmd.blend,
                     format,
                     samples,
+                    kind: cmd.geometry.kind(),
                 };
                 self.ensure_pipeline(key, cmd.shader.as_deref());
             }
@@ -500,10 +624,10 @@ impl Renderer {
             let mut last_texture: *const wgpu::BindGroup = std::ptr::null();
             let mut last_uniforms: Option<(u32, u32)> = None;
             let mut last_scissor: Option<[u32; 4]> = None;
-            let mut last_geometry: *const wgpu::Buffer = std::ptr::null();
+            let mut mesh_bound = false;
 
             for cmd in &frame.cmds[range] {
-                if cmd.index_end <= cmd.index_start {
+                if cmd.end <= cmd.start {
                     continue;
                 }
                 let scissor = clamp_scissor(cmd.scissor, size);
@@ -515,6 +639,7 @@ impl Renderer {
                     blend: cmd.blend,
                     format,
                     samples,
+                    kind: cmd.geometry.kind(),
                 };
                 if last_pipeline != Some(key) {
                     rpass.set_pipeline(&self.pipelines[&key]);
@@ -536,23 +661,49 @@ impl Renderer {
                     rpass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
                     last_scissor = Some(scissor);
                 }
-                let (vb, ib) = match &cmd.geometry {
-                    Geometry::Frame => (&self.vertex_buffer.buffer, &self.index_buffer.buffer),
-                    Geometry::Retained { vertices, indices } => (&**vertices, &**indices),
-                };
-                if !std::ptr::eq(last_geometry, vb) {
-                    rpass.set_vertex_buffer(0, vb.slice(..));
-                    rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    last_geometry = vb as *const _;
+                let count = cmd.end - cmd.start;
+                match &cmd.geometry {
+                    Geometry::Mesh => {
+                        if !mesh_bound {
+                            rpass.set_vertex_buffer(0, self.vertex_buffer.buffer.slice(..));
+                            rpass.set_index_buffer(
+                                self.index_buffer.buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            mesh_bound = true;
+                        }
+                        rpass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+                        stats.triangles += count / 3;
+                    }
+                    Geometry::Quads | Geometry::Retained { .. } => {
+                        let buffer = match &cmd.geometry {
+                            Geometry::Retained { instances } => &**instances,
+                            _ => &self.instance_buffer.buffer,
+                        };
+                        // Offsetting the binding instead of passing a first
+                        // instance works on every backend, including WebGL2.
+                        let start = cmd.start as u64 * INSTANCE_SIZE;
+                        let end = cmd.end as u64 * INSTANCE_SIZE;
+                        rpass.set_vertex_buffer(0, buffer.slice(start..end));
+                        mesh_bound = false;
+                        rpass.draw(0..6, 0..count);
+                        stats.triangles += count * 2;
+                    }
                 }
-                rpass.draw_indexed(cmd.index_start..cmd.index_end, 0, 0..1);
                 stats.draw_calls += 1;
-                stats.triangles += (cmd.index_end - cmd.index_start) / 3;
             }
         }
+        // Triangle instances were counted as two triangles above.
+        stats.triangles = stats.triangles.saturating_sub(frame.triangle_instances);
         stats
     }
 }
+
+const QUAD_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x4, 4 => Unorm8x4, 5 => Uint32
+];
+const MESH_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4];
 
 fn clamp_scissor(scissor: Option<[i32; 4]>, (w, h): (u32, u32)) -> [u32; 4] {
     match scissor {
@@ -569,5 +720,22 @@ fn clamp_scissor(scissor: Option<[i32; 4]>, (w, h): (u32, u32)) -> [u32; 4] {
                 (y1 - y0).max(0) as u32,
             ]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quad_instance_layout_matches_attributes() {
+        // The vertex layout (QUAD_ATTRIBUTES) and the WGSL in `vs_quad` assume
+        // this exact 48-byte layout.
+        assert_eq!(INSTANCE_SIZE, 48);
+        assert_eq!(std::mem::offset_of!(QuadInstance, uv), 24);
+        assert_eq!(std::mem::offset_of!(QuadInstance, color), 40);
+        assert_eq!(std::mem::offset_of!(QuadInstance, kind), 44);
+        let last = QUAD_ATTRIBUTES.last().unwrap();
+        assert_eq!(last.offset + last.format.size(), INSTANCE_SIZE);
     }
 }

@@ -31,7 +31,10 @@ pub use spritebatch::SpriteBatch;
 
 use self::font::GlyphAtlas;
 use self::image::Gpu;
-use self::renderer::{DrawCmd, FrameData, Geometry, Globals, Pass, Renderer, ScreenTarget};
+use self::renderer::{
+    DrawCmd, FrameData, GeomKind, Geometry, Globals, Pass, QUAD_KIND, QuadInstance, Renderer,
+    ScreenTarget,
+};
 use crate::math::Transform;
 use crate::{Conf, Error, Result};
 
@@ -141,8 +144,13 @@ pub struct Graphics {
     default_filter: FilterMode,
     state: State,
     stack: Vec<StackEntry>,
-    batch_open: bool,
-    batch_tex: u64,
+    /// The kind and texture id of the last command, while it can still be
+    /// extended with frame geometry.
+    batch: Option<(GeomKind, u64)>,
+    /// Texture id for which quads can be appended without any other check
+    /// (pass open, quad command with this texture open, no custom shader).
+    /// 0 means "take the slow path".
+    fast_tex: u64,
     pass_open: bool,
     pass_proj: Transform,
     pass_scale: f32,
@@ -260,8 +268,8 @@ impl Graphics {
                 canvas: None,
             },
             stack: Vec::new(),
-            batch_open: false,
-            batch_tex: 0,
+            batch: None,
+            fast_tex: 0,
             pass_open: false,
             pass_proj: Transform::IDENTITY,
             pass_scale: 1.0,
@@ -290,7 +298,14 @@ impl Graphics {
         self.user_uniforms_offset = 0;
         self.shader_version = u64::MAX;
         self.pass_open = false;
-        self.batch_open = false;
+        self.break_batch();
+    }
+
+    /// Makes the next draw start a new command.
+    #[inline]
+    fn break_batch(&mut self) {
+        self.batch = None;
+        self.fast_tex = 0;
     }
 
     pub(crate) fn begin_frame(&mut self) {
@@ -316,6 +331,7 @@ impl Graphics {
             self.set_canvas(None);
         }
         self.atlas.flush();
+        self.frame.close_cmd();
 
         let mut surface_texture = None;
         let mut reconfigure = false;
@@ -677,7 +693,7 @@ impl Graphics {
     pub fn set_blend_mode(&mut self, mode: BlendMode) {
         if self.state.blend != mode {
             self.state.blend = mode;
-            self.batch_open = false;
+            self.break_batch();
         }
     }
 
@@ -696,7 +712,7 @@ impl Graphics {
             return;
         }
         self.state.shader = shader.cloned();
-        self.batch_open = false;
+        self.break_batch();
         self.shader_version = u64::MAX;
         if shader.is_none() {
             self.user_uniforms_offset = 0;
@@ -710,13 +726,13 @@ impl Graphics {
     /// Restricts drawing to a screen-space rectangle (ignores transforms).
     pub fn set_scissor(&mut self, x: f32, y: f32, w: f32, h: f32) {
         self.state.scissor = Some([x, y, w.max(0.0), h.max(0.0)]);
-        self.batch_open = false;
+        self.break_batch();
     }
 
     /// Removes the scissor rectangle.
     pub fn reset_scissor(&mut self) {
         if self.state.scissor.take().is_some() {
-            self.batch_open = false;
+            self.break_batch();
         }
     }
 
@@ -736,7 +752,7 @@ impl Graphics {
         }
         self.state.canvas = canvas.cloned();
         self.pass_open = false;
-        self.batch_open = false;
+        self.break_batch();
     }
 
     /// Runs `f` with drawing redirected to `canvas`, then restores the previous target
@@ -794,7 +810,7 @@ impl Graphics {
                 self.set_blend_mode(s.blend);
                 self.set_shader(s.shader.as_ref());
                 if s.scissor != self.state.scissor {
-                    self.batch_open = false;
+                    self.break_batch();
                 }
                 self.state = s;
             }
@@ -871,7 +887,7 @@ impl Graphics {
     }
 
     fn open_pass(&mut self, clear: Option<Color>) {
-        self.batch_open = false;
+        self.break_batch();
         let target = self.state.canvas.as_ref().map(|c| c.image.clone());
         let (w, h, scale) = match &target {
             Some(img) => (img.width() as f32, img.height() as f32, 1.0),
@@ -908,7 +924,7 @@ impl Graphics {
         let data = *shader.inner.uniforms.lock().unwrap();
         self.shader_version = version;
         self.user_uniforms_offset = self.push_uniform_block(bytemuck::cast_slice(&data));
-        self.batch_open = false;
+        self.break_batch();
     }
 
     fn scissor_px(&self) -> Option<[i32; 4]> {
@@ -924,23 +940,29 @@ impl Graphics {
     }
 
     fn new_cmd(&mut self, texture: Arc<wgpu::BindGroup>, geometry: Geometry, globals_offset: u32) {
-        let start = self.frame.indices.len() as u32;
+        self.frame.close_cmd();
+        self.fast_tex = 0;
+        let start = match geometry {
+            Geometry::Quads => self.frame.quads.len() as u32,
+            Geometry::Mesh => self.frame.indices.len() as u32,
+            Geometry::Retained { .. } => 0,
+        };
         self.frame.cmds.push(DrawCmd {
             shader: self.state.shader.as_ref().map(|s| s.inner.clone()),
             blend: self.state.blend,
             texture,
             geometry,
-            index_start: start,
-            index_end: start,
+            start,
+            end: start,
             scissor: self.scissor_px(),
             globals_offset,
             uniforms_offset: self.user_uniforms_offset,
         });
     }
 
-    /// Prepares to append geometry using `tex`; returns the index of the first new vertex.
-    #[inline]
-    fn batch(&mut self, tex: &Image) -> u32 {
+    /// Opens the pass, syncs shader uniforms and opens a command of `kind`
+    /// using `tex`, unless the last command can simply be extended.
+    fn begin_geometry(&mut self, kind: GeomKind, tex: &Image) {
         if !self.pass_open {
             self.open_pass(None);
         }
@@ -948,23 +970,46 @@ impl Graphics {
             self.sync_shader_uniforms();
         }
         let id = tex.id();
-        if !self.batch_open || self.batch_tex != id {
-            self.new_cmd(tex.current_bind_group(), Geometry::Frame, self.pass_globals);
-            self.batch_open = true;
-            self.batch_tex = id;
-        }
-        self.frame.vertices.len() as u32
-    }
-
-    #[inline]
-    fn end_geometry(&mut self) {
-        let n = self.frame.indices.len() as u32;
-        if let Some(cmd) = self.frame.cmds.last_mut() {
-            cmd.index_end = n;
+        if self.batch != Some((kind, id)) {
+            let geometry = match kind {
+                GeomKind::Quads => Geometry::Quads,
+                GeomKind::Mesh => Geometry::Mesh,
+            };
+            self.new_cmd(tex.current_bind_group(), geometry, self.pass_globals);
+            self.batch = Some((kind, id));
         }
     }
 
-    #[inline]
+    /// Slow path of [`ensure_quads`](Self::ensure_quads).
+    #[inline(never)]
+    fn begin_quads(&mut self, tex: &Image) {
+        self.begin_geometry(GeomKind::Quads, tex);
+        // With a custom shader every draw re-checks the uniforms, so only
+        // shaderless drawing gets the fast path.
+        if self.state.shader.is_none() {
+            self.fast_tex = tex.id();
+        }
+    }
+
+    /// Makes sure quad instances pushed next are drawn with `tex` and the
+    /// current state. A single comparison when nothing changed.
+    #[inline(always)]
+    fn ensure_quads(&mut self, tex: &Image) {
+        if self.fast_tex != tex.id() {
+            self.begin_quads(tex);
+        }
+    }
+
+    /// [`ensure_quads`](Self::ensure_quads) for the shape texture.
+    #[inline(always)]
+    fn ensure_white_quads(&mut self) {
+        if self.fast_tex != self.white.id() {
+            let white = self.white.clone();
+            self.begin_quads(&white);
+        }
+    }
+
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn push_quad(
         &mut self,
@@ -977,28 +1022,10 @@ impl Graphics {
         uv: [f32; 4],
         color: [u8; 4],
     ) {
-        let base = self.batch(tex);
+        self.ensure_quads(tex);
         self.frame
-            .vertices
-            .extend_from_slice(&quad_vertices(t, x0, y0, x1, y1, uv, color));
-        self.frame
-            .indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        self.end_geometry();
-    }
-
-    /// Appends transformed, untextured vertices and returns the base index.
-    fn push_shape_vertices(&mut self, pts: &[[f32; 2]]) -> u32 {
-        let white = self.white.clone();
-        let base = self.batch(&white);
-        let t = self.state.transform;
-        let c = self.state.color8;
-        let [u, v] = self.white_uv;
-        self.frame.vertices.extend(pts.iter().map(|p| {
-            let (x, y) = t.apply(p[0], p[1]);
-            Vertex::new(x, y, u, v, c)
-        }));
-        base
+            .quads
+            .push(quad_instance(t, x0, y0, x1, y1, uv, color));
     }
 
     /// Fills a convex (or star-shaped around `pts[0]`) polygon as a triangle fan.
@@ -1006,15 +1033,25 @@ impl Graphics {
         if pts.len() < 3 {
             return;
         }
-        let base = self.push_shape_vertices(pts);
-        let n = pts.len() as u32;
-        self.frame.indices.reserve(((n - 2) * 3) as usize);
-        for i in 1..n - 1 {
+        self.ensure_white_quads();
+        let t = self.state.transform;
+        let c = self.state.color8;
+        let uv = self.white_uv;
+        let apply = |p: &[f32; 2]| {
+            let (x, y) = t.apply(p[0], p[1]);
+            [x, y]
+        };
+        let first = apply(&pts[0]);
+        let mut prev = apply(&pts[1]);
+        self.frame.quads.reserve(pts.len() - 2);
+        for p in &pts[2..] {
+            let cur = apply(p);
             self.frame
-                .indices
-                .extend_from_slice(&[base, base + i, base + i + 1]);
+                .quads
+                .push(QuadInstance::triangle(first, prev, cur, uv, c));
+            prev = cur;
         }
-        self.end_geometry();
+        self.frame.triangle_instances += pts.len() as u32 - 2;
     }
 
     /// Strokes a polyline with the current line width using miter joins.
@@ -1070,22 +1107,42 @@ impl Graphics {
             offsets.push([p[0] + off[0], p[1] + off[1]]);
             offsets.push([p[0] - off[0], p[1] - off[1]]);
         }
-        let base = self.push_shape_vertices(&offsets);
-        let segments = if closed { n } else { n - 1 } as u32;
-        let count = n as u32;
-        for i in 0..segments {
-            let j = (i + 1) % count;
-            let (a0, a1, b0, b1) = (
-                base + i * 2,
-                base + i * 2 + 1,
-                base + j * 2,
-                base + j * 2 + 1,
-            );
-            self.frame
-                .indices
-                .extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+        let t = self.state.transform;
+        for p in offsets.iter_mut() {
+            let (x, y) = t.apply(p[0], p[1]);
+            *p = [x, y];
         }
-        self.end_geometry();
+        self.ensure_white_quads();
+        let c = self.state.color8;
+        let [u, v] = self.white_uv;
+        if !closed && n == 2 {
+            // A single segment is a parallelogram: one quad.
+            let o = &offsets;
+            self.frame.quads.push(QuadInstance {
+                p0: o[0],
+                p1: o[2],
+                p2: o[1],
+                uv: [u, v, u, v],
+                color: c,
+                kind: QUAD_KIND,
+            });
+        } else {
+            let segments = if closed { n } else { n - 1 };
+            self.frame.quads.reserve(segments * 2);
+            for i in 0..segments {
+                let j = (i + 1) % n;
+                let (a0, a1, b0, b1) = (
+                    offsets[i * 2],
+                    offsets[i * 2 + 1],
+                    offsets[j * 2],
+                    offsets[j * 2 + 1],
+                );
+                let quads = &mut self.frame.quads;
+                quads.push(QuadInstance::triangle(a0, b0, b1, [u, v], c));
+                quads.push(QuadInstance::triangle(a0, b1, a1, [u, v], c));
+            }
+            self.frame.triangle_instances += segments as u32 * 2;
+        }
         self.scratch = offsets;
     }
 
@@ -1134,11 +1191,18 @@ impl Graphics {
     pub fn rectangle(&mut self, mode: DrawMode, x: f32, y: f32, w: f32, h: f32) {
         match mode {
             DrawMode::Fill => {
-                let white = self.white.clone();
+                self.ensure_white_quads();
                 let [u, v] = self.white_uv;
-                let t = self.state.transform;
-                let c = self.state.color8;
-                self.push_quad(&white, &t, x, y, x + w, y + h, [u, v, u, v], c);
+                let q = quad_instance(
+                    &self.state.transform,
+                    x,
+                    y,
+                    x + w,
+                    y + h,
+                    [u, v, u, v],
+                    self.state.color8,
+                );
+                self.frame.quads.push(q);
             }
             DrawMode::Line => self.stroke(&[[x, y], [x + w, y], [x + w, y + h], [x, y + h]], true),
         }
@@ -1266,24 +1330,26 @@ impl Graphics {
 
     /// Draws square points at a flat `[x1, y1, x2, y2, ...]` list.
     pub fn points(&mut self, points: &[f32]) {
-        let white = self.white.clone();
+        let points = points.as_chunks::<2>().0;
+        if points.is_empty() {
+            return;
+        }
+        self.ensure_white_quads();
         let [u, v] = self.white_uv;
         let half = self.state.point_size * 0.5;
         let c = self.state.color8;
         let t = self.state.transform;
-        for p in points.as_chunks::<2>().0 {
+        self.frame.quads.extend(points.iter().map(|p| {
             let (x, y) = t.apply(p[0], p[1]);
-            self.push_quad(
-                &white,
-                &Transform::IDENTITY,
-                x - half,
-                y - half,
-                x + half,
-                y + half,
-                [u, v, u, v],
-                c,
-            );
-        }
+            QuadInstance {
+                p0: [x - half, y - half],
+                p1: [x + half, y - half],
+                p2: [x - half, y + half],
+                uv: [u, v, u, v],
+                color: c,
+                kind: QUAD_KIND,
+            }
+        }));
     }
 
     /// Draws arbitrary triangles. Vertex positions are transformed by the
@@ -1292,7 +1358,8 @@ impl Graphics {
     /// `image`, texture coordinates are ignored and the mesh is solid.
     pub fn mesh(&mut self, vertices: &[Vertex], indices: Option<&[u32]>, image: Option<&Image>) {
         let tex = image.cloned().unwrap_or_else(|| self.white.clone());
-        let base = self.batch(&tex);
+        self.begin_geometry(GeomKind::Mesh, &tex);
+        let base = self.frame.vertices.len() as u32;
         let t = self.state.transform;
         let white_uv = image.is_none().then_some(self.white_uv);
         self.frame.vertices.extend(vertices.iter().map(|v| {
@@ -1310,7 +1377,6 @@ impl Graphics {
                 .indices
                 .extend(base..base + (vertices.len() / 3 * 3) as u32),
         }
-        self.end_geometry();
     }
 
     // ------------------------------------------------------------------
@@ -1341,29 +1407,52 @@ impl Graphics {
         self.draw_image(image, Some(quad), &params.into());
     }
 
-    #[inline]
+    #[inline(always)]
     fn draw_image(&mut self, image: &Image, quad: Option<Quad>, params: &DrawParams) {
-        if image.inner.is_canvas
-            && self
-                .state
-                .canvas
-                .as_ref()
-                .is_some_and(|c| c.image.id() == image.id())
-        {
-            log::warn!("a canvas cannot be drawn into itself; skipping");
+        let inner = &*image.inner;
+        if inner.is_canvas && self.is_current_canvas(image) {
             return;
         }
-        let (iw, ih) = (image.width() as f32, image.height() as f32);
-        let q = quad.unwrap_or(Quad::new(0.0, 0.0, iw, ih));
-        let local = params.to_transform(q.w, q.h);
+        let (iw, ih) = (inner.width as f32, inner.height as f32);
+        let (w, h, uv) = match quad {
+            None => (iw, ih, [0.0, 0.0, 1.0, 1.0]),
+            Some(q) => (
+                q.w,
+                q.h,
+                [q.x / iw, q.y / ih, (q.x + q.w) / iw, (q.y + q.h) / ih],
+            ),
+        };
+        let local = params.to_transform(w, h);
         let t = if self.state.transform == Transform::IDENTITY {
             local
         } else {
             self.state.transform.mul(&local)
         };
         let color = params.color.map_or(self.state.color8, Color::to_rgba8);
-        let uv = [q.x / iw, q.y / ih, (q.x + q.w) / iw, (q.y + q.h) / ih];
-        self.push_quad(image, &t, 0.0, 0.0, q.w, q.h, uv, color);
+        self.ensure_quads(image);
+        self.frame.quads.push(QuadInstance {
+            p0: [t.tx, t.ty],
+            p1: [t.a * w + t.tx, t.b * w + t.ty],
+            p2: [t.c * h + t.tx, t.d * h + t.ty],
+            uv,
+            color,
+            kind: QUAD_KIND,
+        });
+    }
+
+    /// True (with a warning) if `image` is the canvas being drawn into.
+    #[cold]
+    #[inline(never)]
+    fn is_current_canvas(&self, image: &Image) -> bool {
+        let same = self
+            .state
+            .canvas
+            .as_ref()
+            .is_some_and(|c| c.image.id() == image.id());
+        if same {
+            log::warn!("a canvas cannot be drawn into itself; skipping");
+        }
+        same
     }
 
     fn draw_sprite_batch(&mut self, batch: &SpriteBatch, params: &DrawParams) {
@@ -1371,7 +1460,7 @@ impl Graphics {
             self.open_pass(None);
         }
         self.sync_shader_uniforms();
-        let Some((vertices, indices, count)) = batch.prepare(&self.gpu, self.frame_index) else {
+        let Some((instances, count)) = batch.prepare(&self.gpu, self.frame_index) else {
             return;
         };
         let (w, h) = batch.image().dimensions();
@@ -1384,13 +1473,13 @@ impl Graphics {
         let globals = self.push_globals(&mvp, tint);
         self.new_cmd(
             batch.image().current_bind_group(),
-            Geometry::Retained { vertices, indices },
+            Geometry::Retained { instances },
             globals,
         );
         let cmd = self.frame.cmds.last_mut().unwrap();
-        cmd.index_start = 0;
-        cmd.index_end = count;
-        self.batch_open = false;
+        cmd.start = 0;
+        cmd.end = count;
+        self.break_batch();
     }
 
     // ------------------------------------------------------------------
@@ -1482,11 +1571,11 @@ impl Graphics {
                     if page_img.as_ref().is_none_or(|(p, _)| *p != e.page) {
                         page_img = Some((e.page, self.atlas.page_image(e.page).clone()));
                     }
-                    let img = page_img.as_ref().unwrap().1.clone();
+                    let img = &page_img.as_ref().unwrap().1;
                     let gx = (x_off + pen.round() + e.offset[0]) / dpi;
                     let gy = (baseline + e.offset[1]) / dpi;
                     self.push_quad(
-                        &img,
+                        img,
                         &t,
                         gx,
                         gy,
@@ -1510,9 +1599,9 @@ fn present_mode(vsync: bool) -> wgpu::PresentMode {
     }
 }
 
-/// The four corners of the local rectangle `(x0, y0)-(x1, y1)` under `t`.
+/// The local rectangle `(x0, y0)-(x1, y1)` under `t` as a quad instance.
 #[inline(always)]
-pub(crate) fn quad_vertices(
+pub(crate) fn quad_instance(
     t: &Transform,
     x0: f32,
     y0: f32,
@@ -1520,31 +1609,17 @@ pub(crate) fn quad_vertices(
     y1: f32,
     uv: [f32; 4],
     color: [u8; 4],
-) -> [Vertex; 4] {
+) -> QuadInstance {
     let (x0a, x0b) = (t.a * x0, t.b * x0);
     let (x1a, x1b) = (t.a * x1, t.b * x1);
     let (y0c, y0d) = (t.c * y0 + t.tx, t.d * y0 + t.ty);
     let (y1c, y1d) = (t.c * y1 + t.tx, t.d * y1 + t.ty);
-    [
-        Vertex {
-            pos: [x0a + y0c, x0b + y0d],
-            uv: [uv[0], uv[1]],
-            color,
-        },
-        Vertex {
-            pos: [x1a + y0c, x1b + y0d],
-            uv: [uv[2], uv[1]],
-            color,
-        },
-        Vertex {
-            pos: [x1a + y1c, x1b + y1d],
-            uv: [uv[2], uv[3]],
-            color,
-        },
-        Vertex {
-            pos: [x0a + y1c, x0b + y1d],
-            uv: [uv[0], uv[3]],
-            color,
-        },
-    ]
+    QuadInstance {
+        p0: [x0a + y0c, x0b + y0d],
+        p1: [x1a + y0c, x1b + y0d],
+        p2: [x0a + y1c, x0b + y1d],
+        uv,
+        color,
+        kind: QUAD_KIND,
+    }
 }
