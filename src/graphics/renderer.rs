@@ -21,12 +21,17 @@ use crate::util::FxBuild;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
+    /// Position in pixels, before the current transform.
     pub pos: [f32; 2],
+    /// Texture coordinate in `0..1`.
     pub uv: [f32; 2],
+    /// RGBA8 vertex color.
     pub color: [u8; 4],
 }
 
 impl Vertex {
+    /// A vertex at `(x, y)` with texture coordinate `(u, v)`. Use
+    /// [`Color::to_rgba8`](super::Color::to_rgba8) for `color`.
     pub const fn new(x: f32, y: f32, u: f32, v: f32, color: [u8; 4]) -> Self {
         Vertex {
             pos: [x, y],
@@ -260,6 +265,7 @@ pub(crate) struct ScreenTarget<'a> {
     pub size: (u32, u32),
 }
 
+/// Renderer counters for one frame, from [`Graphics::stats`](super::Graphics::stats).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameStats {
     /// GPU draw calls issued last frame.

@@ -8,109 +8,213 @@ use winit::keyboard::KeyCode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Key {
+    /// The A key.
     A,
+    /// The B key.
     B,
+    /// The C key.
     C,
+    /// The D key.
     D,
+    /// The E key.
     E,
+    /// The F key.
     F,
+    /// The G key.
     G,
+    /// The H key.
     H,
+    /// The I key.
     I,
+    /// The J key.
     J,
+    /// The K key.
     K,
+    /// The L key.
     L,
+    /// The M key.
     M,
+    /// The N key.
     N,
+    /// The O key.
     O,
+    /// The P key.
     P,
+    /// The Q key.
     Q,
+    /// The R key.
     R,
+    /// The S key.
     S,
+    /// The T key.
     T,
+    /// The U key.
     U,
+    /// The V key.
     V,
+    /// The W key.
     W,
+    /// The X key.
     X,
+    /// The Y key.
     Y,
+    /// The Z key.
     Z,
+    /// The 0 key on the main row.
     Num0,
+    /// The 1 key on the main row.
     Num1,
+    /// The 2 key on the main row.
     Num2,
+    /// The 3 key on the main row.
     Num3,
+    /// The 4 key on the main row.
     Num4,
+    /// The 5 key on the main row.
     Num5,
+    /// The 6 key on the main row.
     Num6,
+    /// The 7 key on the main row.
     Num7,
+    /// The 8 key on the main row.
     Num8,
+    /// The 9 key on the main row.
     Num9,
+    /// Function key F1.
     F1,
+    /// Function key F2.
     F2,
+    /// Function key F3.
     F3,
+    /// Function key F4.
     F4,
+    /// Function key F5.
     F5,
+    /// Function key F6.
     F6,
+    /// Function key F7.
     F7,
+    /// Function key F8.
     F8,
+    /// Function key F9.
     F9,
+    /// Function key F10.
     F10,
+    /// Function key F11.
     F11,
+    /// Function key F12.
     F12,
+    /// Up arrow.
     Up,
+    /// Down arrow.
     Down,
+    /// Left arrow.
     Left,
+    /// Right arrow.
     Right,
+    /// Space bar.
     Space,
+    /// Enter / Return (main keyboard).
     Enter,
+    /// Escape.
     Escape,
+    /// Tab.
     Tab,
+    /// Backspace.
     Backspace,
+    /// Delete.
     Delete,
+    /// Insert.
     Insert,
+    /// Home.
     Home,
+    /// End.
     End,
+    /// Page Up.
     PageUp,
+    /// Page Down.
     PageDown,
+    /// Left Shift.
     LShift,
+    /// Right Shift.
     RShift,
+    /// Left Control.
     LCtrl,
+    /// Right Control.
     RCtrl,
+    /// Left Alt (Option on macOS).
     LAlt,
+    /// Right Alt (AltGr on many layouts).
     RAlt,
+    /// Left Super (Windows / Command key).
     LSuper,
+    /// Right Super (Windows / Command key).
     RSuper,
+    /// `-` key.
     Minus,
+    /// `=` key.
     Equals,
+    /// `[` key.
     LeftBracket,
+    /// `]` key.
     RightBracket,
+    /// `\` key.
     Backslash,
+    /// `;` key.
     Semicolon,
+    /// `'` key.
     Quote,
+    /// `,` key.
     Comma,
+    /// `.` key.
     Period,
+    /// `/` key.
     Slash,
+    /// `` ` `` key (left of 1).
     Backtick,
+    /// Caps Lock.
     CapsLock,
+    /// Num Lock.
     NumLock,
+    /// Scroll Lock.
     ScrollLock,
+    /// Print Screen.
     PrintScreen,
+    /// Pause / Break.
     Pause,
+    /// Context menu key.
     Menu,
+    /// Keypad 0.
     Kp0,
+    /// Keypad 1.
     Kp1,
+    /// Keypad 2.
     Kp2,
+    /// Keypad 3.
     Kp3,
+    /// Keypad 4.
     Kp4,
+    /// Keypad 5.
     Kp5,
+    /// Keypad 6.
     Kp6,
+    /// Keypad 7.
     Kp7,
+    /// Keypad 8.
     Kp8,
+    /// Keypad 9.
     Kp9,
+    /// Keypad `+`.
     KpAdd,
+    /// Keypad `-`.
     KpSubtract,
+    /// Keypad `*`.
     KpMultiply,
+    /// Keypad `/`.
     KpDivide,
+    /// Keypad Enter.
     KpEnter,
+    /// Keypad `.`.
     KpDecimal,
     /// Any key love2drs does not have a name for.
     Unknown,
@@ -523,6 +627,7 @@ impl Keyboard {
         self.key_repeat = enabled;
     }
 
+    /// Whether key repeat is enabled.
     pub fn has_key_repeat(&self) -> bool {
         self.key_repeat
     }

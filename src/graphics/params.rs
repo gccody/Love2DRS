@@ -11,14 +11,19 @@ use crate::math::{Transform, Vec2};
 /// `(x, y)` tuples and [`Vec2`] convert into `DrawParams` automatically.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DrawParams {
+    /// X position in pixels.
     pub x: f32,
+    /// Y position in pixels.
     pub y: f32,
     /// Rotation in radians (clockwise, since y points down).
     pub rotation: f32,
+    /// Horizontal scale (negative mirrors).
     pub sx: f32,
+    /// Vertical scale (negative mirrors).
     pub sy: f32,
     /// Origin offset in pixels (the point that sits at `x, y` and is rotated around).
     pub ox: f32,
+    /// Vertical origin offset in pixels (see `ox`).
     pub oy: f32,
     /// Origin as a fraction of the drawable's size; overrides `ox/oy` when set.
     pub anchor: Option<(f32, f32)>,
@@ -44,6 +49,7 @@ impl Default for DrawParams {
 }
 
 impl DrawParams {
+    /// Identity params: at `(0, 0)`, no rotation, scale 1.
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -59,6 +65,7 @@ impl DrawParams {
         }
     }
 
+    /// Sets the position.
     #[inline]
     pub fn pos(mut self, x: f32, y: f32) -> Self {
         self.x = x;
@@ -66,6 +73,7 @@ impl DrawParams {
         self
     }
 
+    /// Sets the rotation in radians (clockwise on screen).
     #[inline]
     pub fn rotation(mut self, radians: f32) -> Self {
         self.rotation = radians;
@@ -80,6 +88,7 @@ impl DrawParams {
         self
     }
 
+    /// Non-uniform scale.
     #[inline]
     pub fn scale_xy(mut self, sx: f32, sy: f32) -> Self {
         self.sx = sx;
@@ -116,6 +125,7 @@ impl DrawParams {
         self.anchor(0.5, 0.5)
     }
 
+    /// Tints this draw with `color` instead of the current [`Graphics::set_color`](super::Graphics::set_color).
     #[inline]
     pub fn color(mut self, color: impl Into<Color>) -> Self {
         self.color = Some(color.into());

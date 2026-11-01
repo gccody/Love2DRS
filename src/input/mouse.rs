@@ -9,11 +9,17 @@ use crate::math::{Vec2, vec2};
 /// A mouse button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
+    /// Primary (usually left) button.
     Left,
+    /// Secondary (usually right) button.
     Right,
+    /// Middle button / wheel click.
     Middle,
+    /// "Back" side button.
     Back,
+    /// "Forward" side button.
     Forward,
+    /// Any other button, by platform index.
     Other(u16),
 }
 
@@ -99,6 +105,7 @@ impl Mouse {
         self.wheel
     }
 
+    /// Whether `button` is currently held down.
     pub fn is_down(&self, button: MouseButton) -> bool {
         self.down[button.index()]
     }
@@ -118,11 +125,13 @@ impl Mouse {
         self.inside
     }
 
+    /// Shows or hides the cursor while it is over the window.
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         self.window.set_cursor_visible(visible);
     }
 
+    /// Whether the cursor is visible.
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -141,6 +150,7 @@ impl Mouse {
         }
     }
 
+    /// Whether the cursor is confined to the window.
     pub fn is_grabbed(&self) -> bool {
         self.grabbed
     }

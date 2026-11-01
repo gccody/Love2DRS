@@ -95,7 +95,7 @@ struct Starfall {
 /// A short synthesized tone with a pitch sweep and decay envelope.
 fn tone(start_hz: f32, end_hz: f32, seconds: f32, noise: f32) -> SoundData {
     let mut phase = 0.0f32;
-    let mut rng = love2drs::math::Rng::new(7);
+    let mut rng = Rng::new(7);
     SoundData::generate(44_100, seconds, move |t| {
         let k = t / seconds;
         let hz = start_hz + (end_hz - start_hz) * k;
@@ -330,7 +330,7 @@ impl Starfall {
         }
     }
 
-    fn draw_player(&self, g: &mut love2drs::graphics::Graphics) {
+    fn draw_player(&self, g: &mut Graphics) {
         if self.invulnerable > 0.0 && (self.time * 20.0) as i32 % 2 == 0 {
             return;
         }
@@ -373,7 +373,7 @@ impl Starfall {
         }
     }
 
-    fn draw_fallers(&self, g: &mut love2drs::graphics::Graphics) {
+    fn draw_fallers(&self, g: &mut Graphics) {
         // Glows first in one additive pass, so they batch together.
         g.set_blend_mode(BlendMode::Add);
         for f in &self.fallers {
@@ -439,7 +439,7 @@ impl Starfall {
         }
     }
 
-    fn draw_hud(&self, g: &mut love2drs::graphics::Graphics) {
+    fn draw_hud(&self, g: &mut Graphics) {
         g.set_font(&self.medium);
         g.set_color(Color::WHITE);
         g.print(&format!("SCORE {}", self.score), 20.0, 16.0);
@@ -479,7 +479,7 @@ impl Starfall {
 
     fn draw_centered(
         &self,
-        g: &mut love2drs::graphics::Graphics,
+        g: &mut Graphics,
         font: &Font,
         text: &str,
         y: f32,

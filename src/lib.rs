@@ -49,6 +49,8 @@
 //! they batch together. Use [`graphics::SpriteBatch`] for large static
 //! geometry such as tile maps: it stays on the GPU between frames.
 
+#![warn(missing_docs)]
+
 mod app;
 #[cfg(feature = "audio")]
 pub mod audio;
@@ -71,15 +73,25 @@ pub use wgpu;
 pub use winit;
 
 /// Everything needed for a typical game: `use love2drs::prelude::*;`
+///
+/// Besides the drawing types and callbacks, this includes the module types you
+/// pass to helper functions (`fn draw_hud(g: &mut Graphics)`,
+/// `fn new(audio: &Audio)`) and the common gameplay math (`Rng`, `approach`,
+/// `noise2`, ...). Rarer items stay in their modules: [`timer::Timer`],
+/// [`window::Window`], [`graphics::FrameStats`], [`graphics::IntoUniform`],
+/// [`math::sin_cos`] and [`math::set_random_seed`].
 pub mod prelude {
     #[cfg(feature = "audio")]
-    pub use crate::audio::{SoundData, Source};
+    pub use crate::audio::{Audio, SoundData, Source};
     pub use crate::graphics::DrawMode::{self, Fill, Line};
     pub use crate::graphics::{
-        Align, BlendMode, Canvas, Color, DrawParams, Drawable, FilterMode, Font, Image, ImageData,
-        Quad, Shader, SpriteBatch, Vertex, WrapMode,
+        Align, BlendMode, Canvas, Color, DrawParams, Drawable, FilterMode, Font, Graphics, Image,
+        ImageData, Quad, Shader, SpriteBatch, Vertex, WrapMode,
     };
-    pub use crate::input::{Key, MouseButton};
-    pub use crate::math::{Transform, Vec2, lerp, random, random_int, random_range, vec2};
+    pub use crate::input::{Key, Keyboard, Mouse, MouseButton};
+    pub use crate::math::{
+        Rng, Transform, Vec2, approach, lerp, noise1, noise2, random, random_int, random_normal,
+        random_range, vec2,
+    };
     pub use crate::{Conf, Context, Error, Game, Result};
 }

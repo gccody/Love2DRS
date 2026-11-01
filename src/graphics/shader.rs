@@ -149,6 +149,7 @@ impl Shader {
 
 /// Values that can be sent to a shader uniform slot.
 pub trait IntoUniform {
+    /// The value packed into one `vec4<f32>` (unused components are zero).
     fn into_uniform(self) -> [f32; 4];
 }
 

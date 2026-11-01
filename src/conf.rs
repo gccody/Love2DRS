@@ -52,22 +52,27 @@ impl Conf {
         }
     }
 
+    /// Window size in logical pixels.
     pub fn size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
         self
     }
 
+    /// Whether the user can resize the window (default `false`).
     pub fn resizable(mut self, resizable: bool) -> Self {
         self.resizable = resizable;
         self
     }
 
+    /// Start in borderless fullscreen (default `false`).
     pub fn fullscreen(mut self, fullscreen: bool) -> Self {
         self.fullscreen = fullscreen;
         self
     }
 
+    /// Synchronise with the display refresh rate (default `true`). Turn off to
+    /// measure raw frame rate.
     pub fn vsync(mut self, vsync: bool) -> Self {
         self.vsync = vsync;
         self
@@ -80,11 +85,13 @@ impl Conf {
         self
     }
 
+    /// Smallest size, in logical pixels, a resizable window may be shrunk to.
     pub fn min_size(mut self, width: u32, height: u32) -> Self {
         self.min_size = Some((width, height));
         self
     }
 
+    /// Upper bound for `dt` in seconds (default `0.25`).
     pub fn max_dt(mut self, max_dt: f32) -> Self {
         self.max_dt = max_dt;
         self

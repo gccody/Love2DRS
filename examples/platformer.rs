@@ -11,8 +11,6 @@
 //!
 //! Run with `cargo run --release --example platformer`.
 
-use love2drs::graphics::Graphics;
-use love2drs::math::{Rng, approach};
 use love2drs::prelude::*;
 
 const VIEW_W: u32 = 320;

@@ -1,9 +1,13 @@
 /// An RGBA color with components in `0.0..=1.0` (LÖVE 11 convention).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
+    /// Red, `0.0..=1.0`.
     pub r: f32,
+    /// Green, `0.0..=1.0`.
     pub g: f32,
+    /// Blue, `0.0..=1.0`.
     pub b: f32,
+    /// Alpha (opacity), `0.0..=1.0`.
     pub a: f32,
 }
 
@@ -14,23 +18,36 @@ impl Default for Color {
 }
 
 impl Color {
+    /// Opaque white `(1, 1, 1)`.
     pub const WHITE: Color = Color::rgb(1.0, 1.0, 1.0);
+    /// Opaque black `(0, 0, 0)`.
     pub const BLACK: Color = Color::rgb(0.0, 0.0, 0.0);
+    /// Fully transparent black.
     pub const TRANSPARENT: Color = Color::rgba(0.0, 0.0, 0.0, 0.0);
+    /// Opaque red `(1, 0, 0)`.
     pub const RED: Color = Color::rgb(1.0, 0.0, 0.0);
+    /// Opaque green `(0, 1, 0)`.
     pub const GREEN: Color = Color::rgb(0.0, 1.0, 0.0);
+    /// Opaque blue `(0, 0, 1)`.
     pub const BLUE: Color = Color::rgb(0.0, 0.0, 1.0);
+    /// Opaque yellow `(1, 1, 0)`.
     pub const YELLOW: Color = Color::rgb(1.0, 1.0, 0.0);
+    /// Opaque cyan `(0, 1, 1)`.
     pub const CYAN: Color = Color::rgb(0.0, 1.0, 1.0);
+    /// Opaque magenta `(1, 0, 1)`.
     pub const MAGENTA: Color = Color::rgb(1.0, 0.0, 1.0);
+    /// Opaque orange `(1, 0.6, 0)`.
     pub const ORANGE: Color = Color::rgb(1.0, 0.6, 0.0);
+    /// Opaque mid gray `(0.5, 0.5, 0.5)`.
     pub const GRAY: Color = Color::rgb(0.5, 0.5, 0.5);
 
+    /// An opaque color from `0.0..=1.0` components.
     #[inline]
     pub const fn rgb(r: f32, g: f32, b: f32) -> Color {
         Color { r, g, b, a: 1.0 }
     }
 
+    /// A color from `0.0..=1.0` components including alpha.
     #[inline]
     pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color {
         Color { r, g, b, a }

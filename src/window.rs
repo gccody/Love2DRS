@@ -15,10 +15,12 @@ impl Window {
         Window { inner, title }
     }
 
+    /// The current window title.
     pub fn title(&self) -> &str {
         &self.title
     }
 
+    /// Changes the window title.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
         self.inner.set_title(&self.title);
@@ -40,6 +42,7 @@ impl Window {
             .request_inner_size(winit::dpi::LogicalSize::new(width, height));
     }
 
+    /// Physical pixels per logical pixel (e.g. `2.0` on a Retina display).
     pub fn scale_factor(&self) -> f64 {
         self.inner.scale_factor()
     }
@@ -50,22 +53,27 @@ impl Window {
             .set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
     }
 
+    /// Whether the window is currently fullscreen.
     pub fn is_fullscreen(&self) -> bool {
         self.inner.fullscreen().is_some()
     }
 
+    /// Allows or forbids the user resizing the window.
     pub fn set_resizable(&mut self, resizable: bool) {
         self.inner.set_resizable(resizable);
     }
 
+    /// Whether the window has keyboard focus.
     pub fn has_focus(&self) -> bool {
         self.inner.has_focus()
     }
 
+    /// Minimizes (iconifies) the window.
     pub fn minimize(&mut self) {
         self.inner.set_minimized(true);
     }
 
+    /// Maximizes the window.
     pub fn maximize(&mut self) {
         self.inner.set_maximized(true);
     }

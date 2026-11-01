@@ -36,6 +36,7 @@ impl SpriteBatch {
         }
     }
 
+    /// The image every sprite in the batch samples from.
     pub fn image(&self) -> &Image {
         &self.image
     }
@@ -45,6 +46,7 @@ impl SpriteBatch {
         self.sprites.len()
     }
 
+    /// Whether the batch has no sprites.
     pub fn is_empty(&self) -> bool {
         self.sprites.is_empty()
     }

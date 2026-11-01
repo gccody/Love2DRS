@@ -41,7 +41,9 @@ use crate::{Conf, Error, Result};
 /// Whether shapes are filled or outlined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawMode {
+    /// Solid shape.
     Fill,
+    /// Outline drawn with the current [line width](Graphics::set_line_width).
     Line,
 }
 
@@ -53,14 +55,17 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.image.width()
     }
 
+    /// Height in pixels.
     pub fn height(&self) -> u32 {
         self.image.height()
     }
 
+    /// `(width, height)` in pixels.
     pub fn dimensions(&self) -> (u32, u32) {
         self.image.dimensions()
     }
@@ -70,10 +75,12 @@ impl Canvas {
         &self.image
     }
 
+    /// Changes how the canvas is filtered when drawn scaled.
     pub fn set_filter(&self, filter: FilterMode) {
         self.image.set_filter(filter);
     }
 
+    /// Changes how texture coordinates outside the canvas wrap.
     pub fn set_wrap(&self, wrap: WrapMode) {
         self.image.set_wrap(wrap);
     }
@@ -81,6 +88,7 @@ impl Canvas {
 
 /// Anything that can be passed to [`Graphics::draw`].
 pub trait Drawable {
+    /// Records this object into `g` with the given placement.
     fn draw(&self, g: &mut Graphics, params: &DrawParams);
 }
 
@@ -636,6 +644,7 @@ impl Graphics {
         self.default_filter = filter;
     }
 
+    /// The filter mode new images and canvases get.
     pub fn default_filter(&self) -> FilterMode {
         self.default_filter
     }
@@ -649,6 +658,7 @@ impl Graphics {
         self.background = color.into();
     }
 
+    /// The clear color set with [`set_background_color`](Self::set_background_color).
     pub fn background_color(&self) -> Color {
         self.background
     }
@@ -661,14 +671,17 @@ impl Graphics {
         self.state.color8 = c.to_rgba8();
     }
 
+    /// The current draw color.
     pub fn color(&self) -> Color {
         self.state.color
     }
 
+    /// Width, in pixels, of lines and `Line`-mode shapes (default `1.0`).
     pub fn set_line_width(&mut self, width: f32) {
         self.state.line_width = width;
     }
 
+    /// The current line width.
     pub fn line_width(&self) -> f32 {
         self.state.line_width
     }
@@ -678,18 +691,22 @@ impl Graphics {
         self.state.point_size = size;
     }
 
+    /// The current point size.
     pub fn point_size(&self) -> f32 {
         self.state.point_size
     }
 
+    /// Font used by [`print`](Self::print) and friends from now on.
     pub fn set_font(&mut self, font: &Font) {
         self.state.font = font.clone();
     }
 
+    /// The current font.
     pub fn font(&self) -> &Font {
         &self.state.font
     }
 
+    /// How subsequent draws combine with the target (default [`BlendMode::Alpha`]).
     pub fn set_blend_mode(&mut self, mode: BlendMode) {
         if self.state.blend != mode {
             self.state.blend = mode;
@@ -697,6 +714,7 @@ impl Graphics {
         }
     }
 
+    /// The current blend mode.
     pub fn blend_mode(&self) -> BlendMode {
         self.state.blend
     }
@@ -719,6 +737,7 @@ impl Graphics {
         }
     }
 
+    /// The active custom shader, if any.
     pub fn shader(&self) -> Option<&Shader> {
         self.state.shader.as_ref()
     }
@@ -736,6 +755,7 @@ impl Graphics {
         }
     }
 
+    /// The active scissor rectangle `(x, y, w, h)`, if any.
     pub fn scissor(&self) -> Option<(f32, f32, f32, f32)> {
         self.state.scissor.map(|[x, y, w, h]| (x, y, w, h))
     }
@@ -764,6 +784,7 @@ impl Graphics {
         self.set_canvas(previous.as_ref());
     }
 
+    /// The canvas being drawn into, or `None` for the screen.
     pub fn canvas(&self) -> Option<&Canvas> {
         self.state.canvas.as_ref()
     }
@@ -823,18 +844,22 @@ impl Graphics {
         self.state.transform = Transform::IDENTITY;
     }
 
+    /// Moves the coordinate system by `(x, y)`.
     pub fn translate(&mut self, x: f32, y: f32) {
         self.state.transform.translate(x, y);
     }
 
+    /// Rotates the coordinate system by `angle` radians (clockwise on screen).
     pub fn rotate(&mut self, angle: f32) {
         self.state.transform.rotate(angle);
     }
 
+    /// Scales the coordinate system.
     pub fn scale(&mut self, sx: f32, sy: f32) {
         self.state.transform.scale(sx, sy);
     }
 
+    /// Shears the coordinate system.
     pub fn shear(&mut self, kx: f32, ky: f32) {
         self.state.transform.shear(kx, ky);
     }
@@ -844,10 +869,12 @@ impl Graphics {
         self.state.transform = self.state.transform.mul(t);
     }
 
+    /// Replaces the current transform with `t`.
     pub fn replace_transform(&mut self, t: Transform) {
         self.state.transform = t;
     }
 
+    /// The current transform.
     pub fn transform(&self) -> Transform {
         self.state.transform
     }
@@ -1290,6 +1317,7 @@ impl Graphics {
         );
     }
 
+    /// Draws a triangle through three points.
     #[allow(clippy::too_many_arguments)]
     pub fn triangle(
         &mut self,

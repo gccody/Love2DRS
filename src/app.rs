@@ -15,11 +15,17 @@ use crate::{Conf, Error, Result};
 
 /// Everything a game can touch: the `love.*` modules.
 pub struct Context {
+    /// Drawing, images, fonts, canvases and shaders (`love.graphics`).
     pub graphics: Graphics,
+    /// Keyboard state (`love.keyboard`).
     pub keyboard: Keyboard,
+    /// Mouse state and cursor control (`love.mouse`).
     pub mouse: Mouse,
+    /// Frame timing (`love.timer`).
     pub timer: Timer,
+    /// The game window (`love.window`).
     pub window: Window,
+    /// Sound loading and playback (`love.audio`). Requires the `audio` feature.
     #[cfg(feature = "audio")]
     pub audio: crate::audio::Audio,
     quit: bool,
@@ -48,15 +54,19 @@ pub trait Game: 'static {
     /// only delivered after `ctx.keyboard.set_key_repeat(true)`.
     fn key_pressed(&mut self, ctx: &mut Context, key: Key, repeat: bool) {}
 
+    /// A key was released.
     fn key_released(&mut self, ctx: &mut Context, key: Key) {}
 
     /// Text typed by the user (already composed by the OS keyboard layout / IME).
     fn text_input(&mut self, ctx: &mut Context, text: &str) {}
 
+    /// A mouse button went down at `(x, y)` in logical pixels.
     fn mouse_pressed(&mut self, ctx: &mut Context, x: f32, y: f32, button: MouseButton) {}
 
+    /// A mouse button was released at `(x, y)` in logical pixels.
     fn mouse_released(&mut self, ctx: &mut Context, x: f32, y: f32, button: MouseButton) {}
 
+    /// The cursor moved to `(x, y)`; `(dx, dy)` is the movement since the last event.
     fn mouse_moved(&mut self, ctx: &mut Context, x: f32, y: f32, dx: f32, dy: f32) {}
 
     /// Mouse wheel movement; `y > 0` scrolls away from the user.
@@ -65,6 +75,8 @@ pub trait Game: 'static {
     /// The window was resized (logical pixels).
     fn resize(&mut self, ctx: &mut Context, width: f32, height: f32) {}
 
+    /// The window gained (`true`) or lost (`false`) keyboard focus. Held keys and
+    /// buttons are released when focus is lost.
     fn focus(&mut self, ctx: &mut Context, focused: bool) {}
 
     /// Files dropped onto the window.

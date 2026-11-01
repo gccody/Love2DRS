@@ -8,7 +8,9 @@ pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 pub enum Error {
     /// A file could not be read or written.
     Io {
+        /// The path that was being accessed.
         path: String,
+        /// The underlying I/O error.
         source: std::io::Error,
     },
     /// An image could not be decoded or encoded.

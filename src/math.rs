@@ -10,11 +10,17 @@ pub use glam::{Vec2, vec2};
 /// Maps `(x, y)` to `(a*x + c*y + tx, b*x + d*y + ty)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
+    /// X-axis x component (scale / rotation).
     pub a: f32,
+    /// X-axis y component (rotation / shear).
     pub b: f32,
+    /// Y-axis x component (rotation / shear).
     pub c: f32,
+    /// Y-axis y component (scale / rotation).
     pub d: f32,
+    /// Translation along x.
     pub tx: f32,
+    /// Translation along y.
     pub ty: f32,
 }
 
@@ -25,6 +31,7 @@ impl Default for Transform {
 }
 
 impl Transform {
+    /// The transform that leaves points unchanged.
     pub const IDENTITY: Transform = Transform {
         a: 1.0,
         b: 0.0,
@@ -34,6 +41,7 @@ impl Transform {
         ty: 0.0,
     };
 
+    /// A pure translation by `(x, y)`.
     #[inline]
     pub fn translation(x: f32, y: f32) -> Self {
         Transform {
@@ -43,6 +51,7 @@ impl Transform {
         }
     }
 
+    /// A rotation by `angle` radians (clockwise on screen, since y points down).
     #[inline]
     pub fn rotation(angle: f32) -> Self {
         let (s, c) = sin_cos(angle);
@@ -56,6 +65,7 @@ impl Transform {
         }
     }
 
+    /// A scale by `sx` horizontally and `sy` vertically.
     #[inline]
     pub fn scaling(sx: f32, sy: f32) -> Self {
         Transform {
@@ -97,6 +107,7 @@ impl Transform {
         }
     }
 
+    /// Transforms the point `(x, y)`.
     #[inline]
     pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
         (
@@ -105,27 +116,32 @@ impl Transform {
         )
     }
 
+    /// Transforms the point `p`.
     #[inline]
     pub fn apply_vec(&self, p: Vec2) -> Vec2 {
         let (x, y) = self.apply(p.x, p.y);
         vec2(x, y)
     }
 
+    /// Appends a translation (applied before the existing transform).
     #[inline]
     pub fn translate(&mut self, x: f32, y: f32) {
         *self = self.mul(&Transform::translation(x, y));
     }
 
+    /// Appends a rotation in radians (applied before the existing transform).
     #[inline]
     pub fn rotate(&mut self, angle: f32) {
         *self = self.mul(&Transform::rotation(angle));
     }
 
+    /// Appends a scale (applied before the existing transform).
     #[inline]
     pub fn scale(&mut self, sx: f32, sy: f32) {
         *self = self.mul(&Transform::scaling(sx, sy));
     }
 
+    /// Appends a shear by factors `kx` and `ky`.
     pub fn shear(&mut self, kx: f32, ky: f32) {
         *self = self.mul(&Transform {
             a: 1.0,
@@ -235,10 +251,12 @@ pub struct Rng {
 }
 
 impl Rng {
+    /// A generator with the given seed. The same seed always gives the same sequence.
     pub fn new(seed: u64) -> Self {
         Rng { state: seed }
     }
 
+    /// The next raw 64-bit value.
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0xA076_1D64_78BD_642F);

@@ -113,9 +113,12 @@ pub enum FilterMode {
 /// How texture coordinates outside `0..1` are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WrapMode {
+    /// Repeat the edge pixels.
     #[default]
     Clamp = 0,
+    /// Tile the image.
     Repeat = 1,
+    /// Tile the image, mirroring every other repetition.
     MirroredRepeat = 2,
 }
 
@@ -210,10 +213,12 @@ impl Image {
         img
     }
 
+    /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.inner.width
     }
 
+    /// Height in pixels.
     pub fn height(&self) -> u32 {
         self.inner.height
     }
@@ -223,10 +228,12 @@ impl Image {
         (self.inner.width, self.inner.height)
     }
 
+    /// The current filter mode.
     pub fn filter(&self) -> FilterMode {
         self.inner.sampling.lock().unwrap().0
     }
 
+    /// The current wrap mode.
     pub fn wrap(&self) -> WrapMode {
         self.inner.sampling.lock().unwrap().1
     }
@@ -308,13 +315,18 @@ impl Image {
 /// (`love.graphics.newQuad`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quad {
+    /// Left edge in pixels.
     pub x: f32,
+    /// Top edge in pixels.
     pub y: f32,
+    /// Width in pixels.
     pub w: f32,
+    /// Height in pixels.
     pub h: f32,
 }
 
 impl Quad {
+    /// The region with top-left `(x, y)` and size `w x h` pixels.
     pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Quad { x, y, w, h }
     }
@@ -413,28 +425,34 @@ impl ImageData {
         Ok(())
     }
 
+    /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    /// Height in pixels.
     pub fn height(&self) -> u32 {
         self.height
     }
 
+    /// Raw row-major RGBA8 bytes.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
+    /// Mutable raw row-major RGBA8 bytes.
     pub fn pixels_mut(&mut self) -> &mut [u8] {
         &mut self.pixels
     }
 
+    /// The color at `(x, y)`. Panics if out of bounds.
     pub fn get_pixel(&self, x: u32, y: u32) -> Color {
         let i = ((y * self.width + x) * 4) as usize;
         let p = &self.pixels[i..i + 4];
         Color::rgba8(p[0], p[1], p[2], p[3])
     }
 
+    /// Sets the color at `(x, y)`; out-of-bounds writes are ignored.
     pub fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
         if x < self.width && y < self.height {
             let i = ((y * self.width + x) * 4) as usize;
@@ -457,6 +475,7 @@ impl ImageData {
         }
     }
 
+    /// Consumes the data, returning the raw RGBA8 bytes.
     pub fn into_pixels(self) -> Vec<u8> {
         self.pixels
     }

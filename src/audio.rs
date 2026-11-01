@@ -73,10 +73,12 @@ impl SoundData {
         Self::from_samples(sample_rate, 1, samples)
     }
 
+    /// Number of interleaved channels (1 = mono, 2 = stereo).
     pub fn channels(&self) -> u16 {
         self.channels
     }
 
+    /// Sample frames per second.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -319,6 +321,7 @@ impl Source {
             && !self.controls.paused.load(Ordering::Relaxed)
     }
 
+    /// Whether the source was paused with [`pause`](Source::pause) and not yet resumed.
     pub fn is_paused(&self) -> bool {
         self.controls.playing.load(Ordering::Relaxed)
             && self.controls.paused.load(Ordering::Relaxed)
@@ -329,6 +332,7 @@ impl Source {
         store_f32(&self.controls.volume, volume.max(0.0));
     }
 
+    /// The volume multiplier set with [`set_volume`](Source::set_volume).
     pub fn volume(&self) -> f32 {
         load_f32(&self.controls.volume)
     }
@@ -338,14 +342,17 @@ impl Source {
         store_f32(&self.controls.pitch, pitch.max(0.0));
     }
 
+    /// The pitch multiplier set with [`set_pitch`](Source::set_pitch).
     pub fn pitch(&self) -> f32 {
         load_f32(&self.controls.pitch)
     }
 
+    /// Whether playback restarts from the beginning when it reaches the end.
     pub fn set_looping(&self, looping: bool) {
         self.controls.looping.store(looping, Ordering::Relaxed);
     }
 
+    /// Whether the source loops.
     pub fn is_looping(&self) -> bool {
         self.controls.looping.load(Ordering::Relaxed)
     }
@@ -369,6 +376,7 @@ impl Source {
         self.data.duration()
     }
 
+    /// The decoded samples this source plays.
     pub fn data(&self) -> &SoundData {
         &self.data
     }
@@ -429,6 +437,7 @@ impl Audio {
         store_f32(&self.master, volume.max(0.0));
     }
 
+    /// The master volume.
     pub fn volume(&self) -> f32 {
         load_f32(&self.master)
     }

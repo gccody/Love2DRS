@@ -5,10 +5,13 @@ edition = "2024"
 rust-version = "1.88"
 description = "A LÖVE-inspired 2D game framework for Rust: as easy as love2d, batched and fast on wgpu."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/gccody/Love2DRS"
+homepage = "https://github.com/gccody/Love2DRS"
+documentation = "https://docs.rs/love2drs"
 readme = "README.md"
 keywords = ["gamedev", "2d", "game", "wgpu", "love2d"]
 categories = ["game-engines", "graphics", "rendering"]
-exclude = ["/assets/icon.svg", "/screenshots"]
+exclude = ["/assets/icon.svg", "/screenshots", "/skills", "/.claude-plugin"]
 
 [features]
 default = ["audio", "png", "jpeg"]

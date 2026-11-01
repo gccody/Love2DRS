@@ -39,9 +39,12 @@ fn default_face() -> Arc<FontFace> {
 /// Horizontal alignment for [`Graphics::printf`](super::Graphics::printf).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Align {
+    /// Flush with the left edge of the box.
     #[default]
     Left,
+    /// Centered in the box.
     Center,
+    /// Flush with the right edge of the box.
     Right,
 }
 
@@ -103,6 +106,7 @@ impl Font {
         }
     }
 
+    /// Size in pixels (one em).
     pub fn size(&self) -> f32 {
         self.size
     }
@@ -138,6 +142,7 @@ impl Font {
         self.line_height = multiplier;
     }
 
+    /// The line spacing multiplier.
     pub fn line_height(&self) -> f32 {
         self.line_height
     }
