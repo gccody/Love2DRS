@@ -1,4 +1,4 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="https://raw.githubusercontent.com/gccody/Love2DRS/master/assets/icon.svg" width="64" height="64" alt="">
 
 # love2drs
 
@@ -34,8 +34,23 @@ fn main() -> love2drs::Result {
 
 | | |
 |---|---|
-| ![showcase](screenshots/showcase.png) | ![starfall](screenshots/starfall.png) |
-| ![platformer](screenshots/platformer.png) | ![shaders](screenshots/shaders.png) |
+## Installation
+
+```toml
+[dependencies]
+love2drs = { git = "https://github.com/gccody/Love2DRS" }
+
+# Recommended: compile dependencies (wgpu, image decoding, audio) with optimizations
+# even in debug builds. Without this, `cargo run` builds of your game can be very slow.
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+Cargo only applies `[profile.*]` settings from your own `Cargo.toml`, not from a
+dependency's, so this has to go in your game's manifest. Rust 1.88 or newer is required.
+
+| ![showcase](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/showcase.png) | ![starfall](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/starfall.png) |
+| ![platformer](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/platformer.png) | ![shaders](https://raw.githubusercontent.com/gccody/Love2DRS/master/screenshots/shaders.png) |
 
 ## Examples
 
@@ -122,6 +137,19 @@ Set `LOVE2DRS_SCREENSHOT=out.png` (and optionally `LOVE2DRS_SCREENSHOT_FRAME=60`
 love2drs game save that frame as a PNG and exit. This is useful for CI smoke tests. All the screenshots
 above were captured this way. In game code, call `ctx.graphics.capture_screenshot("shot.png")`.
 
+## Agent skill
+
+The repo includes an [Agent Skill](skills/love2drs/SKILL.md) that teaches coding agents the love2drs API,
+its gotchas and a set of tested recipes. To install it in Claude Code:
+
+```text
+/plugin install love2drs --marketplace gccody/Love2DRS
+```
+
+On Claude Code versions before 2.1.275, run `/plugin marketplace add gccody/Love2DRS`, then
+`/plugin install love2drs@love2drs`. You can also copy `skills/love2drs/` into your project's
+`.claude/skills/` or into `~/.claude/skills/`.
+
 ## Project layout
 
 ```
@@ -142,6 +170,7 @@ src/
   math.rs           Transform, RNG, noise, fast sin_cos
   timer.rs, window.rs
 examples/           runnable demos and games
+skills/love2drs/    agent skill (SKILL.md + API reference + recipes)
 ```
 
 ## Roadmap ideas
@@ -152,6 +181,6 @@ WebAssembly support.
 
 ## License
 
-love2drs is dual-licensed under MIT or Apache-2.0. The bundled default font,
+love2drs is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The bundled default font,
 [Hack](https://sourcefoundry.org/hack/), is under the MIT License and the Bitstream Vera License; see
 `src/graphics/default_font/LICENSE.txt`.

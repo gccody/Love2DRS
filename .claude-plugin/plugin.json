@@ -1,0 +1,12 @@
+{
+  "name": "love2drs",
+  "version": "0.1.0",
+  "description": "Agent skill for building 2D games in Rust with love2drs, a LÖVE-inspired framework on wgpu: API reference, gotchas and tested recipes.",
+  "author": {
+    "name": "gccody"
+  },
+  "homepage": "https://github.com/gccody/Love2DRS",
+  "repository": "https://github.com/gccody/Love2DRS",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["rust", "gamedev", "love2d", "wgpu", "2d"]
+}
