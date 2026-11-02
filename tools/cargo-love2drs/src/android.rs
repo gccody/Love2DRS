@@ -1,9 +1,13 @@
-//! Packages a game as an APK with the Android SDK's own tools.
+//! Packages a game as an APK or app bundle with the Android SDK's own tools.
 //!
 //! The game runs under `NativeActivity`, so there's no Java to compile and no
 //! need for Gradle: Cargo builds a shared library, `aapt2` makes the APK around
 //! the manifest, and the library and assets are added to it before `zipalign`
 //! and `apksigner` finish it.
+//!
+//! An app bundle for Google Play starts the same way, with `aapt2` writing the
+//! protobuf format bundles use. Its files are then rearranged into a module for
+//! `bundletool`, and `jarsigner` signs the result.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -19,15 +23,28 @@ use crate::{Action, Options};
 /// pages, and Google Play requires apps to support them.
 const PAGE_SIZE_KB: u32 = 16;
 const KEYSTORE_PASS_VAR: &str = "LOVE2DRS_KEYSTORE_PASS";
+/// Only needed if the key's password isn't the keystore's.
+const KEY_PASS_VAR: &str = "LOVE2DRS_KEY_PASS";
+const BUNDLETOOL_VAR: &str = "BUNDLETOOL_JAR";
+const BUNDLETOOL_URL: &str = "https://github.com/google/bundletool/releases";
+/// Where Google Play looks for native debug symbols in a bundle.
+const SYMBOLS_METADATA: &str = "com.android.tools.build.debugsymbols";
+/// What Google Play has required of new apps and updates since August 31, 2026.
+const PLAY_MIN_TARGET_SDK: u64 = 36;
 /// Names the crate to turn into a library when running as a rustc wrapper.
 const WRAPPED_CRATE_VAR: &str = "LOVE2DRS_WRAPPED_CRATE";
 
 pub fn main(project: &Project, options: &Options, action: Action) -> Result<(), String> {
     let sdk = Sdk::find()?;
-    let device = (action != Action::Build)
+    let device = matches!(action, Action::Install | Action::Run)
         .then(|| Device::connect(&sdk, options))
         .transpose()?;
     let abis = choose_abis(options, device.as_ref())?;
+    if action == Action::Package {
+        let bundle = build_bundle(project, options, &sdk, &abis)?;
+        println!("Built {}", bundle.display());
+        return Ok(());
+    }
     let apk = build_apk(project, options, &sdk, &abis)?;
     println!("Built {}", apk.display());
 
@@ -195,18 +212,29 @@ fn parse_version(text: &str) -> Option<Vec<u32>> {
 // Building
 // ----------------------------------------------------------------------
 
-fn build_apk(
+/// What an APK and an app bundle are both made from.
+struct Prepared {
+    work: PathBuf,
+    /// The stripped libraries, as `(path on disk, path inside the package)`.
+    libs: Vec<(PathBuf, String)>,
+    /// The libraries before stripping, as `(ABI, file name, path on disk)`.
+    unstripped: Vec<(&'static str, String, PathBuf)>,
+    manifest: PathBuf,
+}
+
+fn prepare(
     project: &Project,
     options: &Options,
     sdk: &Sdk,
     abis: &[Abi],
-) -> Result<PathBuf, String> {
+) -> Result<Prepared, String> {
     let lib_name = project.name.replace('-', "_");
     let out = project.out_dir("android")?;
     let work = out.join(format!("{}-{}", project.name, options.profile_dir()));
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
 
     let mut libs = Vec::new();
+    let mut unstripped = Vec::new();
     for abi in abis {
         let built = compile(project, options, sdk, *abi)?;
         let stripped = work.join(format!("lib{lib_name}-{}.so", abi.name));
@@ -224,37 +252,68 @@ fn build_apk(
             "",
         )?;
         libs.push((stripped, format!("lib/{}/lib{lib_name}.so", abi.name)));
+        unstripped.push((abi.name, format!("lib{lib_name}.so"), built));
     }
 
     let manifest = work.join("AndroidManifest.xml");
     let manifest_text =
         android_manifest(project, &lib_name, !options.release, project.icon.is_some());
     std::fs::write(&manifest, manifest_text).map_err(|e| format!("{}: {e}", manifest.display()))?;
+    Ok(Prepared {
+        work,
+        libs,
+        unstripped,
+        manifest,
+    })
+}
 
-    let base = work.join("base.apk");
+/// Runs `aapt2 link`, which makes a package with the manifest and resources.
+fn link(
+    project: &Project,
+    options: &Options,
+    sdk: &Sdk,
+    prepared: &Prepared,
+    output: &Path,
+    proto_format: bool,
+) -> Result<(), String> {
     let mut aapt2 = Command::new(sdk.tool("aapt2"));
     aapt2
         .arg("link")
         .arg("-o")
-        .arg(&base)
+        .arg(output)
         .arg("-I")
         .arg(&sdk.android_jar)
         .arg("--manifest")
-        .arg(&manifest)
+        .arg(&prepared.manifest)
         .args(["--min-sdk-version", &project.min_sdk.to_string()])
         .args(["--target-sdk-version", &project.target_sdk.to_string()])
         .args(["--version-code", &project.version_code.to_string()])
         .args(["--version-name", &project.version]);
+    if proto_format {
+        aapt2.arg("--proto-format");
+    }
     if !options.release {
         aapt2.arg("--debug-mode");
     }
     if let Some(icon) = &project.icon {
-        aapt2.arg(compile_icon(sdk, &project.root.join(icon), &work)?);
+        aapt2.arg(compile_icon(sdk, &project.root.join(icon), &prepared.work)?);
     }
-    run(&mut aapt2, "")?;
+    run(&mut aapt2, "")
+}
+
+fn build_apk(
+    project: &Project,
+    options: &Options,
+    sdk: &Sdk,
+    abis: &[Abi],
+) -> Result<PathBuf, String> {
+    let prepared = prepare(project, options, sdk, abis)?;
+    let work = &prepared.work;
+    let base = work.join("base.apk");
+    link(project, options, sdk, &prepared, &base, false)?;
 
     let unaligned = work.join("unaligned.apk");
-    add_files(&base, &unaligned, &libs, &project.asset_files()?)?;
+    add_files(&base, &unaligned, &prepared.libs, &project.asset_files()?)?;
 
     let aligned = work.join("aligned.apk");
     run(
@@ -265,9 +324,173 @@ fn build_apk(
         "",
     )?;
 
-    let apk = out.join(format!("{}-{}.apk", project.name, options.profile_dir()));
+    let apk =
+        project
+            .out_dir("android")?
+            .join(format!("{}-{}.apk", project.name, options.profile_dir()));
     sign(sdk, options, &aligned, &apk)?;
     Ok(apk)
+}
+
+/// Makes the `.aab` that Google Play takes.
+fn build_bundle(
+    project: &Project,
+    options: &Options,
+    sdk: &Sdk,
+    abis: &[Abi],
+) -> Result<PathBuf, String> {
+    if project.target_sdk < PLAY_MIN_TARGET_SDK {
+        println!(
+            "warning: Google Play requires target_sdk {PLAY_MIN_TARGET_SDK} or higher, and this \
+             is {}",
+            project.target_sdk
+        );
+    }
+    let bundletool = Bundletool::find(options)?;
+    let prepared = prepare(project, options, sdk, abis)?;
+    let work = &prepared.work;
+
+    let linked = work.join("bundle-linked.apk");
+    link(project, options, sdk, &prepared, &linked, true)?;
+    let module = work.join("bundle-base.zip");
+    write_bundle_module(&linked, &module, &prepared.libs, &project.asset_files()?)?;
+
+    let config = work.join("BundleConfig.json");
+    std::fs::write(&config, bundle_config()).map_err(|e| format!("{}: {e}", config.display()))?;
+
+    let unsigned = work.join("bundle-unsigned.aab");
+    let mut build = bundletool.command();
+    build
+        .arg("build-bundle")
+        .arg("--overwrite")
+        .arg(path_flag("--modules", &module))
+        .arg(path_flag("--config", &config))
+        .arg(path_flag("--output", &unsigned));
+    let symbols_dir = work.join("symbols");
+    for (abi, library, unstripped) in &prepared.unstripped {
+        let dir = symbols_dir.join(abi);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let symbols = dir.join(format!("{library}.sym"));
+        run(
+            Command::new(sdk.llvm_bin()?.join(exe("llvm-objcopy")))
+                .arg("--only-keep-debug")
+                .arg(unstripped)
+                .arg(&symbols),
+            "",
+        )?;
+        build.arg(metadata_flag(abi, library, &symbols));
+    }
+    run(&mut build, JAVA_HINT)?;
+
+    let bundle = project
+        .out_dir("android")?
+        .join(format!("{}-release.aab", project.name));
+    sign_bundle(options, &unsigned, &bundle)?;
+    Ok(bundle)
+}
+
+const JAVA_HINT: &str = "It needs Java: install a JDK or set JAVA_HOME";
+
+/// Tells bundletool to serve native libraries uncompressed and on 16 KB
+/// boundaries, or apps built from the bundle won't install on 16 KB devices.
+fn bundle_config() -> &'static str {
+    r#"{"optimizations":{"uncompressNativeLibraries":{"enabled":true,"alignment":"PAGE_ALIGNMENT_16K"}}}"#
+}
+
+fn path_flag(flag: &str, path: &Path) -> String {
+    format!("{flag}={}", path.display())
+}
+
+fn metadata_flag(abi: &str, library: &str, symbols: &Path) -> String {
+    format!(
+        "--metadata-file={SYMBOLS_METADATA}/{abi}/{library}.sym:{}",
+        symbols.display()
+    )
+}
+
+/// Where a file from `aapt2 --proto-format` goes in a bundle module.
+fn bundle_module_path(name: &str) -> String {
+    if name == "AndroidManifest.xml" {
+        format!("manifest/{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Rearranges what `aapt2` made, adding libraries and assets, into a bundle module.
+fn write_bundle_module(
+    linked: &Path,
+    module: &Path,
+    libs: &[(PathBuf, String)],
+    assets: &[(PathBuf, String)],
+) -> Result<(), String> {
+    let describe = |e: &dyn std::fmt::Display| format!("{}: {e}", module.display());
+    let linked = File::open(linked).map_err(|e| describe(&e))?;
+    let mut input = ZipArchive::new(linked).map_err(|e| describe(&e))?;
+    let out = File::create(module).map_err(|e| describe(&e))?;
+    let mut zip = ZipWriter::new(out);
+    for i in 0..input.len() {
+        let entry = input.by_index_raw(i).map_err(|e| describe(&e))?;
+        let name = entry.name().map_err(|e| describe(&e))?;
+        let name = bundle_module_path(&name);
+        zip.raw_copy_file_rename(entry, name)
+            .map_err(|e| describe(&e))?;
+    }
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let entries = libs.iter().map(|(path, name)| (path, name.clone())).chain(
+        assets
+            .iter()
+            .map(|(path, name)| (path, format!("assets/{name}"))),
+    );
+    for (path, name) in entries {
+        let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        zip.start_file(name, deflated).map_err(|e| describe(&e))?;
+        std::io::copy(&mut file, &mut zip).map_err(|e| describe(&e))?;
+    }
+    zip.finish().map_err(|e| describe(&e))?;
+    Ok(())
+}
+
+/// Google's tool that turns a module into an app bundle. It doesn't come with the
+/// Android SDK.
+enum Bundletool {
+    Jar(PathBuf),
+    Command,
+}
+
+impl Bundletool {
+    fn find(options: &Options) -> Result<Bundletool, String> {
+        let jar = options
+            .bundletool
+            .clone()
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os(BUNDLETOOL_VAR).map(PathBuf::from));
+        if let Some(jar) = jar {
+            return if jar.is_file() {
+                Ok(Bundletool::Jar(jar))
+            } else {
+                Err(format!("bundletool isn't at {}", jar.display()))
+            };
+        }
+        if capture(Command::new("bundletool").arg("version")).is_some() {
+            return Ok(Bundletool::Command);
+        }
+        Err(format!(
+            "making an app bundle needs bundletool: get the jar from {BUNDLETOOL_URL}, then pass \
+             --bundletool <JAR> or set {BUNDLETOOL_VAR}"
+        ))
+    }
+
+    fn command(&self) -> Command {
+        match self {
+            Bundletool::Jar(jar) => {
+                let mut java = Command::new(jdk_tool("java"));
+                java.arg("-jar").arg(jar);
+                java
+            }
+            Bundletool::Command => Command::new("bundletool"),
+        }
+    }
 }
 
 /// Compiles the game into a shared library and returns its path.
@@ -398,6 +621,11 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_ico
         .collect();
     let package = xml_escape(&project.android_id());
     let label = xml_escape(&project.display_name);
+    let category = project
+        .app_category
+        .as_deref()
+        .map(|category| format!("\n        android:appCategory=\"{}\"", xml_escape(category)))
+        .unwrap_or_default();
     let icon = if has_icon {
         "\n        android:icon=\"@mipmap/ic_launcher\""
     } else {
@@ -408,12 +636,15 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_ico
     //
     // `enableOnBackInvokedCallback`: predictive back would keep the back gesture
     // from reaching the game as `Key::Escape`.
+    //
+    // `glEsVersion`: wgpu's lowest requirement. Vulkan isn't declared, because
+    // phones without it run on OpenGL ES instead.
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package}">
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 {permissions}    <application
-        android:label="{label}"{icon}
+        android:label="{label}"{icon}{category}
         android:hasCode="false"
         android:debuggable="{debuggable}"
         android:extractNativeLibs="false"
@@ -558,6 +789,9 @@ fn sign(sdk: &Sdk, options: &Options, input: &Path, output: &Path) -> Result<(),
         if let Some(alias) = &options.key_alias {
             signer.args(["--ks-key-alias", alias]);
         }
+        if std::env::var_os(KEY_PASS_VAR).is_some() {
+            signer.args(["--key-pass", &format!("env:{KEY_PASS_VAR}")]);
+        }
     } else {
         if options.release {
             println!(
@@ -576,6 +810,55 @@ fn sign(sdk: &Sdk, options: &Options, input: &Path, output: &Path) -> Result<(),
     run(&mut signer, "apksigner needs Java: install a JDK")
 }
 
+/// App bundles are signed as jars, not as APKs.
+fn sign_bundle(options: &Options, input: &Path, output: &Path) -> Result<(), String> {
+    let mut signer = Command::new(jdk_tool("jarsigner"));
+    signer.arg("-signedjar").arg(output);
+    if let Some(keystore) = &options.keystore {
+        if std::env::var_os(KEYSTORE_PASS_VAR).is_none() {
+            return Err(format!(
+                "set {KEYSTORE_PASS_VAR} to the password of the keystore"
+            ));
+        }
+        let alias = options
+            .key_alias
+            .as_deref()
+            .ok_or("signing an app bundle needs --key-alias")?;
+        signer
+            .args(["-keystore", keystore])
+            .args(["-storepass:env", KEYSTORE_PASS_VAR]);
+        if std::env::var_os(KEY_PASS_VAR).is_some() {
+            signer.args(["-keypass:env", KEY_PASS_VAR]);
+        }
+        signer.arg(input).arg(alias);
+    } else {
+        println!(
+            "warning: signing with the debug key, which Google Play rejects. Use your upload key \
+             with --keystore <PATH> --key-alias <ALIAS>."
+        );
+        signer
+            .arg("-keystore")
+            .arg(debug_keystore()?)
+            .args(["-storepass", "android", "-keypass", "android"])
+            .arg(input)
+            .arg("androiddebugkey");
+    }
+    // It lists every file it signs without this.
+    signer.stdout(Stdio::null());
+    run(
+        &mut signer,
+        "jarsigner comes with a JDK: install one or set JAVA_HOME",
+    )
+}
+
+/// A program from the JDK, preferring the one `JAVA_HOME` names.
+fn jdk_tool(name: &str) -> PathBuf {
+    std::env::var_os("JAVA_HOME")
+        .map(|java| Path::new(&java).join("bin").join(exe(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 /// The debug key Android Studio uses, created the same way if it's missing.
 fn debug_keystore() -> Result<PathBuf, String> {
     let home = std::env::var_os("ANDROID_USER_HOME")
@@ -591,10 +874,7 @@ fn debug_keystore() -> Result<PathBuf, String> {
         return Ok(path);
     }
     std::fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
-    let keytool = std::env::var_os("JAVA_HOME")
-        .map(|java| Path::new(&java).join("bin").join(exe("keytool")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("keytool"));
+    let keytool = jdk_tool("keytool");
     println!("Creating the debug key at {}", path.display());
     run(
         Command::new(keytool)
@@ -720,7 +1000,9 @@ mod tests {
             target_sdk: 36,
             permissions: vec!["android.permission.INTERNET".into()],
             icon: None,
+            app_category: Some("game".into()),
             ios_deployment_target: "15.0".into(),
+            privacy_manifest: None,
         }
     }
 
@@ -735,6 +1017,43 @@ mod tests {
         assert!(xml.contains(r#"android:value="my_game""#));
         assert!(xml.contains(r#"android:screenOrientation="userLandscape""#));
         assert!(xml.contains(r#"<uses-permission android:name="android.permission.INTERNET" />"#));
+    }
+
+    #[test]
+    fn manifest_declares_the_category_if_there_is_one() {
+        let mut p = project();
+        let xml = android_manifest(&p, "my_game", false, false);
+        assert!(xml.contains(r#"android:appCategory="game""#));
+        p.app_category = None;
+        let xml = android_manifest(&p, "my_game", false, false);
+        assert!(!xml.contains("appCategory"));
+    }
+
+    #[test]
+    fn bundle_modules_keep_the_manifest_in_its_own_directory() {
+        assert_eq!(
+            bundle_module_path("AndroidManifest.xml"),
+            "manifest/AndroidManifest.xml"
+        );
+        assert_eq!(bundle_module_path("resources.pb"), "resources.pb");
+        assert_eq!(bundle_module_path("res/mipmap/a.png"), "res/mipmap/a.png");
+    }
+
+    #[test]
+    fn bundles_ask_for_16_kb_alignment() {
+        let config: serde_json::Value = serde_json::from_str(bundle_config()).unwrap();
+        let native = &config["optimizations"]["uncompressNativeLibraries"];
+        assert_eq!(native["enabled"], true);
+        assert_eq!(native["alignment"], "PAGE_ALIGNMENT_16K");
+    }
+
+    #[test]
+    fn symbols_go_where_google_play_looks() {
+        assert_eq!(
+            metadata_flag("arm64-v8a", "libgame.so", Path::new("out/libgame.so.sym")),
+            "--metadata-file=com.android.tools.build.debugsymbols/arm64-v8a/libgame.so.sym:\
+             out/libgame.so.sym"
+        );
     }
 
     #[test]

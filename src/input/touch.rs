@@ -8,6 +8,14 @@
 //! know about the mouse: the OS does this on desktop and love2drs on mobile. A
 //! tap therefore usually reaches both `touch_pressed` and `mouse_pressed`.
 //! Handle one or the other for the same action.
+//!
+//! A finger can also end without being lifted: the OS takes it for a system
+//! gesture, an incoming call or a notification shade, or the window loses focus.
+//! That reaches `touch_cancelled` and [`Touch::cancelled`], never `touch_released`
+//! or [`Touch::released`], so a game that acts on release doesn't act on these.
+//! The emulated mouse does the same through `mouse_cancelled`.
+
+use winit::event::TouchPhase;
 
 use crate::math::Vec2;
 
@@ -44,6 +52,7 @@ pub struct Touch {
     active: Vec<TouchPoint>,
     pressed: Vec<TouchId>,
     released: Vec<TouchPoint>,
+    cancelled: Vec<TouchPoint>,
 }
 
 impl Touch {
@@ -87,6 +96,12 @@ impl Touch {
         &self.released
     }
 
+    /// Fingers the OS took away since the previous frame, with their last
+    /// position. They weren't lifted, so don't treat them as taps.
+    pub fn cancelled(&self) -> &[TouchPoint] {
+        &self.cancelled
+    }
+
     pub(crate) fn begin(&mut self, id: TouchId, pos: Vec2, pressure: f32) {
         self.active.retain(|t| t.id != id);
         self.active.push(TouchPoint {
@@ -109,21 +124,38 @@ impl Touch {
         Some(d)
     }
 
-    /// Lifts a finger, returning whether it was down.
-    pub(crate) fn end(&mut self, id: TouchId, pos: Vec2, pressure: f32) -> bool {
-        let Some(i) = self.active.iter().position(|t| t.id == id) else {
-            return false;
-        };
+    /// Removes a finger from the screen, updated to where it was last seen.
+    fn take(&mut self, id: TouchId, pos: Vec2, pressure: f32) -> Option<TouchPoint> {
+        let i = self.active.iter().position(|t| t.id == id)?;
         let mut t = self.active.remove(i);
         t.delta += pos - t.position;
         t.position = pos;
         t.pressure = pressure;
-        self.released.push(t);
-        true
+        Some(t)
     }
 
-    pub(crate) fn release_all(&mut self) {
-        self.released.append(&mut self.active);
+    /// Lifts a finger, returning whether it was down.
+    pub(crate) fn end(&mut self, id: TouchId, pos: Vec2, pressure: f32) -> bool {
+        let t = self.take(id, pos, pressure);
+        let was_down = t.is_some();
+        self.released.extend(t);
+        was_down
+    }
+
+    /// Ends a finger the OS took away, returning whether it was down.
+    pub(crate) fn cancel(&mut self, id: TouchId, pos: Vec2, pressure: f32) -> bool {
+        let t = self.take(id, pos, pressure);
+        let was_down = t.is_some();
+        self.cancelled.extend(t);
+        was_down
+    }
+
+    /// Ends every finger, for when focus is lost or the app is suspended, and
+    /// returns them so their callbacks can be sent.
+    pub(crate) fn cancel_all(&mut self) -> Vec<TouchPoint> {
+        let fingers = std::mem::take(&mut self.active);
+        self.cancelled.extend_from_slice(&fingers);
+        fingers
     }
 
     pub(crate) fn end_frame(&mut self) {
@@ -132,6 +164,47 @@ impl Touch {
         }
         self.pressed.clear();
         self.released.clear();
+        self.cancelled.clear();
+    }
+}
+
+/// What a touch does to the emulated mouse on mobile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseAction {
+    Press,
+    Move,
+    Release,
+    Cancel,
+}
+
+/// Tracks the one finger that acts as the mouse on mobile: the first one down.
+#[derive(Default)]
+pub(crate) struct MouseFinger(Option<TouchId>);
+
+impl MouseFinger {
+    /// Works out what this touch does to the mouse, if anything.
+    pub(crate) fn route(&mut self, id: TouchId, phase: TouchPhase) -> Option<MouseAction> {
+        match phase {
+            TouchPhase::Started if self.0.is_none() => {
+                self.0 = Some(id);
+                Some(MouseAction::Press)
+            }
+            TouchPhase::Moved if self.0 == Some(id) => Some(MouseAction::Move),
+            TouchPhase::Ended if self.0 == Some(id) => {
+                self.0 = None;
+                Some(MouseAction::Release)
+            }
+            TouchPhase::Cancelled if self.0 == Some(id) => {
+                self.0 = None;
+                Some(MouseAction::Cancel)
+            }
+            _ => None,
+        }
+    }
+
+    /// Forgets the finger, returning it. Its later events no longer reach the mouse.
+    pub(crate) fn take(&mut self) -> Option<TouchId> {
+        self.0.take()
     }
 }
 
@@ -172,12 +245,64 @@ mod tests {
     }
 
     #[test]
-    fn release_all_reports_released() {
+    fn cancelling_is_not_releasing() {
+        let mut t = Touch::new();
+        let id = TouchId(3);
+        t.begin(id, vec2(10.0, 10.0), 1.0);
+        assert!(t.cancel(id, vec2(12.0, 11.0), 1.0));
+        assert!(!t.cancel(id, vec2(12.0, 11.0), 1.0), "already gone");
+        assert!(!t.end(id, vec2(12.0, 11.0), 1.0), "already gone");
+        assert_eq!(t.count(), 0);
+        assert!(t.released().is_empty());
+        let c = t.cancelled()[0];
+        assert_eq!((c.start, c.position), (vec2(10.0, 10.0), vec2(12.0, 11.0)));
+
+        t.end_frame();
+        assert!(t.cancelled().is_empty());
+    }
+
+    #[test]
+    fn cancel_all_reports_cancelled() {
         let mut t = Touch::new();
         t.begin(TouchId(1), vec2(0.0, 0.0), 1.0);
         t.begin(TouchId(2), vec2(5.0, 5.0), 1.0);
-        t.release_all();
+        let fingers = t.cancel_all();
+        assert_eq!(fingers.len(), 2);
         assert_eq!(t.count(), 0);
-        assert_eq!(t.released().len(), 2);
+        assert_eq!(t.cancelled().len(), 2);
+        assert!(t.released().is_empty());
+    }
+
+    #[test]
+    fn only_the_first_finger_drives_the_mouse() {
+        let (first, second) = (TouchId(1), TouchId(2));
+        let mut m = MouseFinger::default();
+        let press = Some(MouseAction::Press);
+        assert_eq!(m.route(first, TouchPhase::Started), press);
+        assert_eq!(m.route(second, TouchPhase::Started), None);
+        assert_eq!(m.route(second, TouchPhase::Moved), None);
+        assert_eq!(m.route(first, TouchPhase::Moved), Some(MouseAction::Move));
+        assert_eq!(m.route(second, TouchPhase::Ended), None);
+        assert_eq!(
+            m.route(first, TouchPhase::Ended),
+            Some(MouseAction::Release)
+        );
+        assert_eq!(m.route(second, TouchPhase::Started), press);
+        assert_eq!(
+            m.route(second, TouchPhase::Cancelled),
+            Some(MouseAction::Cancel)
+        );
+        assert_eq!(m.route(second, TouchPhase::Cancelled), None);
+    }
+
+    #[test]
+    fn a_forgotten_finger_cannot_release_the_mouse() {
+        // Focus was lost while the finger was down, and it lifts afterwards.
+        let id = TouchId(1);
+        let mut m = MouseFinger::default();
+        m.route(id, TouchPhase::Started);
+        assert_eq!(m.take(), Some(id));
+        assert_eq!(m.route(id, TouchPhase::Moved), None);
+        assert_eq!(m.route(id, TouchPhase::Ended), None);
     }
 }

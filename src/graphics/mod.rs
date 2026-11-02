@@ -8,6 +8,7 @@
 
 mod color;
 mod font;
+mod health;
 mod image;
 mod params;
 mod renderer;
@@ -17,6 +18,7 @@ mod spritebatch;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use ab_glyph::{Font as _, ScaleFont};
 use winit::window::Window as WinitWindow;
@@ -30,6 +32,7 @@ pub use shader::{IntoUniform, Shader, UNIFORM_SLOTS};
 pub use spritebatch::SpriteBatch;
 
 use self::font::GlyphAtlas;
+use self::health::{GpuHealth, SurfaceRecovery, catch_errors};
 use self::image::Gpu;
 use self::renderer::{
     DrawCmd, FrameData, GeomKind, Geometry, Globals, Pass, QUAD_KIND, QuadInstance, Renderer,
@@ -140,6 +143,12 @@ pub struct Graphics {
     /// `None` while the app is suspended: Android takes the native window away
     /// then, and a surface can't outlive it.
     surface: Option<wgpu::Surface<'static>>,
+    surface_recovery: SurfaceRecovery,
+    health: Arc<GpuHealth>,
+    /// Why the game has to stop, for the app loop to pick up.
+    fatal_error: Option<Error>,
+    /// The GPU ran out of memory, for the app loop to tell the game.
+    out_of_memory: bool,
     config: wgpu::SurfaceConfiguration,
     view_format: wgpu::TextureFormat,
     can_screenshot: bool,
@@ -178,61 +187,170 @@ pub struct Graphics {
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 
+/// Everything that depends on which GPU API was chosen.
+struct Connection {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    view_format: wgpu::TextureFormat,
+    can_screenshot: bool,
+    size: winit::dpi::PhysicalSize<u32>,
+}
+
+/// The GPU APIs to try in turn, with `None` leaving the choice to wgpu.
+///
+/// Android lets only one API connect to a window, and wgpu makes a surface for
+/// every API it knows of. A phone with no Vulkan driver still has Vulkan's loader,
+/// so a surface from it would hold the window and leave none for OpenGL ES, which
+/// fails with `BadAlloc`. So first ask whether Vulkan has anything to offer, without
+/// touching the window, and only let one API near the window at a time.
+#[cfg(target_os = "android")]
+fn backends_to_try(display: &winit::event_loop::OwnedDisplayHandle) -> Vec<Option<wgpu::Backends>> {
+    let mut descriptor = instance_descriptor(display);
+    descriptor.backends = wgpu::Backends::VULKAN;
+    let probe = wgpu::Instance::new(descriptor);
+    let adapters = pollster::block_on(probe.enumerate_adapters(wgpu::Backends::VULKAN));
+    if adapters.is_empty() {
+        log::info!("no Vulkan driver, so using OpenGL ES");
+        vec![Some(wgpu::Backends::GL)]
+    } else {
+        vec![Some(wgpu::Backends::VULKAN), Some(wgpu::Backends::GL)]
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn backends_to_try(
+    _display: &winit::event_loop::OwnedDisplayHandle,
+) -> Vec<Option<wgpu::Backends>> {
+    vec![None]
+}
+
+fn instance_descriptor(
+    display: &winit::event_loop::OwnedDisplayHandle,
+) -> wgpu::InstanceDescriptor {
+    #[allow(unused_mut)]
+    let mut descriptor =
+        wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(display.clone()));
+    // Debug builds name every GPU object, and the Vulkan driver in Android 16's
+    // emulator images crashes on that. Nothing on a phone would read the names.
+    #[cfg(target_os = "android")]
+    descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
+    descriptor
+}
+
+/// Opens the window's surface and the GPU with these APIs. A failure leaves the
+/// window free for the next try, since everything made here is dropped.
+fn connect(
+    window: &Arc<WinitWindow>,
+    display: &winit::event_loop::OwnedDisplayHandle,
+    conf: &Conf,
+    backends: Option<wgpu::Backends>,
+) -> Result<Connection> {
+    let gfx_err = |e: &dyn std::fmt::Display| Error::Graphics(e.to_string());
+    let mut descriptor = instance_descriptor(display);
+    if let Some(backends) = backends {
+        descriptor.backends = backends;
+    }
+    let instance = wgpu::Instance::new(descriptor);
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|e| gfx_err(&e))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        ..Default::default()
+    }))
+    .map_err(|e| gfx_err(&e))?;
+    let (device, queue) = pollster::block_on(
+        adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("love2drs device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                .using_resolution(adapter.limits())
+                .using_alignment(adapter.limits()),
+            ..Default::default()
+        }),
+    )
+    .map_err(|e| gfx_err(&e))?;
+
+    let size = crate::window::drawable_size(window);
+    let caps = surface.get_capabilities(&adapter);
+    let mut config = surface
+        .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+        .ok_or_else(|| Error::Graphics("the window surface is not supported by the GPU".into()))?;
+    // Prefer a non-sRGB format so colors blend in gamma space, like LÖVE.
+    if let Some(f) = caps.formats.iter().copied().find(|f| !f.is_srgb()) {
+        config.format = f;
+    }
+    let view_format = config.format.remove_srgb_suffix();
+    if view_format != config.format {
+        config.view_formats = vec![view_format];
+    }
+    let can_screenshot = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+    if can_screenshot {
+        config.usage |= wgpu::TextureUsages::COPY_SRC;
+    }
+    config.present_mode = present_mode(conf.vsync);
+    config.desired_maximum_frame_latency = 2;
+    let (_, error) = catch_errors(&device, || surface.configure(&device, &config));
+    if let Some(error) = error {
+        return Err(Error::Graphics(format!(
+            "can't set up the window surface: {error}"
+        )));
+    }
+    Ok(Connection {
+        instance,
+        surface,
+        adapter,
+        device,
+        queue,
+        config,
+        view_format,
+        can_screenshot,
+        size,
+    })
+}
+
 impl Graphics {
     pub(crate) fn new(
         window: Arc<WinitWindow>,
         display: winit::event_loop::OwnedDisplayHandle,
         conf: &Conf,
     ) -> Result<Graphics> {
-        let gfx_err = |e: &dyn std::fmt::Display| Error::Graphics(e.to_string());
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(display)),
-        );
-        let surface = instance
-            .create_surface(window.clone())
-            .map_err(|e| gfx_err(&e))?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .map_err(|e| gfx_err(&e))?;
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("love2drs device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
-                ..Default::default()
-            }),
-        )
-        .map_err(|e| gfx_err(&e))?;
+        let mut connection = None;
+        let mut last_error = None;
+        for backends in backends_to_try(&display) {
+            match connect(&window, &display, conf, backends) {
+                Ok(c) => {
+                    connection = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("can't use {backends:?}: {e}");
+                    last_error = Some(e);
+                }
+            }
+        }
+        let Some(connection) = connection else {
+            return Err(last_error.unwrap_or_else(|| Error::Graphics("no GPU API to try".into())));
+        };
+        let Connection {
+            instance,
+            surface,
+            adapter,
+            device,
+            queue,
+            config,
+            view_format,
+            can_screenshot,
+            size,
+        } = connection;
         let info = adapter.get_info();
         log::info!("love2drs using {} ({:?})", info.name, info.backend);
-
-        let size = crate::window::drawable_size(&window);
-        let caps = surface.get_capabilities(&adapter);
-        let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .ok_or_else(|| {
-                Error::Graphics("the window surface is not supported by the GPU".into())
-            })?;
-        // Prefer a non-sRGB format so colors blend in gamma space, like LÖVE.
-        if let Some(f) = caps.formats.iter().copied().find(|f| !f.is_srgb()) {
-            config.format = f;
-        }
-        let view_format = config.format.remove_srgb_suffix();
-        if view_format != config.format {
-            config.view_formats = vec![view_format];
-        }
-        let can_screenshot = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
-        if can_screenshot {
-            config.usage |= wgpu::TextureUsages::COPY_SRC;
-        }
-        config.present_mode = present_mode(conf.vsync);
-        config.desired_maximum_frame_latency = 2;
-        surface.configure(&device, &config);
+        let health = GpuHealth::watch(&device);
 
         let msaa = if conf.msaa > 1
             && adapter
@@ -255,6 +373,10 @@ impl Graphics {
             instance,
             window: window.clone(),
             surface: Some(surface),
+            surface_recovery: SurfaceRecovery::default(),
+            health,
+            fatal_error: None,
+            out_of_memory: false,
             config,
             view_format,
             can_screenshot,
@@ -349,6 +471,7 @@ impl Graphics {
 
         let mut surface_texture = None;
         let mut reconfigure = false;
+        let mut surface_lost = false;
         if let Some(surface) = self.surface.as_ref().filter(|_| !self.minimized) {
             match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t) => surface_texture = Some(t),
@@ -356,9 +479,8 @@ impl Graphics {
                     surface_texture = Some(t);
                     reconfigure = true;
                 }
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    reconfigure = true
-                }
+                wgpu::CurrentSurfaceTexture::Outdated => reconfigure = true,
+                wgpu::CurrentSurfaceTexture::Lost => surface_lost = true,
                 wgpu::CurrentSurfaceTexture::Timeout
                 | wgpu::CurrentSurfaceTexture::Occluded
                 | wgpu::CurrentSurfaceTexture::Validation => {}
@@ -403,20 +525,74 @@ impl Graphics {
         {
             log::error!("screenshot failed: {e}");
         }
+        let surface_texture_presented = surface_texture.is_some();
         if let Some(st) = surface_texture {
             self.gpu.queue.present(st);
         }
         if reconfigure {
             self.configure_surface();
         }
+        if surface_texture_presented {
+            self.surface_recovery.ok();
+        }
+        if surface_lost {
+            self.surface_recovery.lost(Instant::now());
+        }
+        self.recover_surface();
+        self.check_health();
         self.frame_index += 1;
         self.reset_frame();
+    }
+
+    /// Gets a lost window surface back, or stops the game if it won't come back.
+    /// wgpu says a lost surface has to be made anew, not just configured again.
+    fn recover_surface(&mut self) {
+        if self.minimized {
+            return;
+        }
+        let now = Instant::now();
+        if self.surface_recovery.gave_up(now) {
+            self.fatal_error.get_or_insert_with(|| {
+                Error::Graphics("the window surface was lost and won't come back".into())
+            });
+        } else if self.surface_recovery.should_retry(now) {
+            // Only one surface can hold a window on Android, so let go first.
+            self.surface = None;
+            match self.instance.create_surface(self.window.clone()) {
+                Ok(surface) => {
+                    self.surface = Some(surface);
+                    self.configure_surface();
+                }
+                Err(e) => log::warn!("can't recreate the window surface: {e}"),
+            }
+        }
+    }
+
+    /// Acts on what the GPU reported during this frame.
+    fn check_health(&mut self) {
+        let health = self.health.end_frame();
+        self.out_of_memory |= health.out_of_memory;
+        if let Some(message) = health.fatal {
+            self.fatal_error.get_or_insert(Error::Graphics(message));
+        }
+    }
+
+    /// Why the game has to stop, if it does.
+    pub(crate) fn take_fatal_error(&mut self) -> Option<Error> {
+        self.fatal_error.take()
+    }
+
+    /// Whether the GPU ran out of memory since this was last asked.
+    pub(crate) fn take_out_of_memory(&mut self) -> bool {
+        std::mem::take(&mut self.out_of_memory)
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32, scale_factor: f64) {
         self.scale_factor = scale_factor as f32;
         self.minimized = width == 0 || height == 0;
         if self.minimized {
+            // Nothing is drawn to the surface, so nothing can be wrong with it yet.
+            self.surface_recovery.ok();
             return;
         }
         if self.config.width != width || self.config.height != height {
@@ -427,15 +603,23 @@ impl Graphics {
         }
     }
 
-    fn configure_surface(&self) {
+    /// Applies the settings to the surface. If that fails it counts as lost,
+    /// which gets retried at the end of a frame.
+    fn configure_surface(&mut self) {
         if let Some(surface) = &self.surface {
-            surface.configure(&self.gpu.device, &self.config);
+            let device = &self.gpu.device;
+            let (_, error) = catch_errors(device, || surface.configure(device, &self.config));
+            if let Some(error) = error {
+                log::warn!("can't configure the window surface: {error}");
+                self.surface_recovery.lost(Instant::now());
+            }
         }
     }
 
     /// Lets go of the window's surface while the app is in the background.
     pub(crate) fn suspend(&mut self) {
         self.surface = None;
+        self.surface_recovery.ok();
     }
 
     /// Reconnects to the window when the app comes back. Images, canvases and

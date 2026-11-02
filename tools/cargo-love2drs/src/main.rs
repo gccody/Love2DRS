@@ -11,11 +11,13 @@ const USAGE: &str = "\
 Builds, installs and runs love2drs games on Android and iOS.
 
 USAGE:
-    cargo love2drs <android|ios> <build|install|run> [OPTIONS]
+    cargo love2drs <android|ios> <build|install|run|package> [OPTIONS]
 
     build     package the game: an .apk on Android, an .app on iOS
     install   build, then put it on the device
     run       install, then launch it and show its log (Ctrl-C to stop watching)
+    package   make what a store takes, always optimized: an .aab for Google Play,
+              an .ipa with its .dSYM for the App Store
 
 WHAT TO BUILD:
     --bin <NAME>            a binary of the package (needed if it has several)
@@ -31,13 +33,19 @@ ANDROID:
                             device's for install/run, both for build
     --keystore <PATH>       release keystore; its password is read from the
                             LOVE2DRS_KEYSTORE_PASS environment variable
-    --key-alias <ALIAS>     key to sign with (default: the keystore's first)
+    --key-alias <ALIAS>     key to sign with (default: the keystore's first, but
+                            `package` needs it). If the key's password differs from
+                            the keystore's, set LOVE2DRS_KEY_PASS
+    --bundletool <JAR>      bundletool for `package` (or set BUNDLETOOL_JAR, or have
+                            a `bundletool` command). Get it from
+                            https://github.com/google/bundletool/releases
 
 IOS (needs macOS with Xcode):
     --device <UDID>         which device (default: the booted simulator)
-    --physical              build for a real iPhone or iPad, not the simulator
-    --identity <NAME>       code signing identity, for --physical
-    --profile <PATH>        provisioning profile, for --physical
+    --physical              build for a real iPhone or iPad, not the simulator;
+                            `package` always does
+    --identity <NAME>       code signing identity, for --physical and `package`
+    --profile <PATH>        provisioning profile, for --physical and `package`
 
 The game's `fn main` needs `love2drs::android_main!(main);` next to it. Options
 for the app itself live in the game's Cargo.toml:
@@ -52,7 +60,13 @@ for the app itself live in the game's Cargo.toml:
     min_sdk = 26                     # Android
     target_sdk = 36                  # Android
     permissions = [\"android.permission.INTERNET\"]  # Android
+    app_category = \"game\"            # Android; the default, and without it Android
+                                     # 16 tablets ignore orientation. \"none\" leaves
+                                     # it out; others are in Android's manifest docs
     ios_deployment_target = \"15.0\"   # iOS
+    privacy_manifest = \"ios/PrivacyInfo.xcprivacy\"  # iOS; default: one is made
+                                     # that declares no tracking or data collection
+                                     # and the system APIs found in the game
 ";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,6 +74,8 @@ pub enum Action {
     Build,
     Install,
     Run,
+    /// What a store takes.
+    Package,
 }
 
 /// The parsed command line.
@@ -74,6 +90,7 @@ pub struct Options {
     pub abis: Vec<String>,
     pub keystore: Option<String>,
     pub key_alias: Option<String>,
+    pub bundletool: Option<String>,
     pub physical: bool,
     pub identity: Option<String>,
     pub profile: Option<String>,
@@ -116,6 +133,7 @@ fn parse_options(args: &mut impl Iterator<Item = String>) -> Result<Options, Str
             "--abi" => o.abis.push(value()?),
             "--keystore" => o.keystore = Some(value()?),
             "--key-alias" => o.key_alias = Some(value()?),
+            "--bundletool" => o.bundletool = Some(value()?),
             "--physical" => o.physical = true,
             "--identity" => o.identity = Some(value()?),
             "--profile" => o.profile = Some(value()?),
@@ -140,14 +158,19 @@ fn run() -> Result<(), String> {
         Some("build") => Action::Build,
         Some("install") => Action::Install,
         Some("run") => Action::Run,
+        Some("package") => Action::Package,
         other => {
             return Err(format!(
-                "expected build, install or run, got `{}`\n\n{USAGE}",
+                "expected build, install, run or package, got `{}`\n\n{USAGE}",
                 other.unwrap_or("")
             ));
         }
     };
-    let options = parse_options(&mut args)?;
+    let mut options = parse_options(&mut args)?;
+    if action == Action::Package {
+        options.release = true;
+        options.physical = true;
+    }
     let project = project::Project::load(&options)?;
     match platform.as_str() {
         "android" => android::main(&project, &options, action),

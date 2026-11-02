@@ -786,3 +786,63 @@ cargo install --git https://github.com/gccody/Love2DRS cargo-love2drs
 cargo love2drs android run   # phone or running emulator
 cargo love2drs ios run       # Simulator, on a Mac
 ```
+
+If the game acts when a finger lifts, a touch the OS takes away (back gesture, incoming call, notification
+shade, losing focus) mustn't count:
+
+```rust
+impl Game for MyGame {
+    fn touch_pressed(&mut self, _ctx: &mut Context, id: TouchId, x: f32, y: f32) {
+        self.pressed = Some((id, vec2(x, y)));
+    }
+
+    fn touch_released(&mut self, _ctx: &mut Context, id: TouchId, x: f32, y: f32) {
+        if self.pressed.take().is_some_and(|(pressed, _)| pressed == id) {
+            self.tap(vec2(x, y));
+        }
+    }
+
+    // The player didn't let go. No touch_released follows.
+    fn touch_cancelled(&mut self, _ctx: &mut Context, _id: TouchId, _x: f32, _y: f32) {
+        self.pressed = None;
+    }
+}
+```
+
+Mouse-only games do the same with `mouse_cancelled`.
+
+## 15. Packaging for the stores
+
+```toml
+[package.metadata.love2drs]
+app_category = "game"     # the default; keeps a locked orientation working on Android 16 tablets
+privacy_manifest = "ios/PrivacyInfo.xcprivacy"  # needed if the game collects data, see below
+```
+
+Google Play takes an `.aab`. `package` always builds optimized, for arm64 and x86_64 unless `--abi` says
+otherwise. It needs [bundletool](https://github.com/google/bundletool/releases) and a JDK:
+
+```sh
+LOVE2DRS_KEYSTORE_PASS=... cargo love2drs android package \
+    --bundletool bundletool-all.jar --keystore upload.jks --key-alias upload
+```
+
+The bundle lands in `target/love2drs/android/<name>-release.aab`, with native debug symbols for Google Play
+inside it. Without `--keystore` it's signed with the debug key, which Google Play rejects. Set
+`LOVE2DRS_KEY_PASS` if the key's password differs from the keystore's, and `BUNDLETOOL_JAR` instead of
+`--bundletool` if that's easier.
+
+The App Store takes an `.ipa`. On a Mac with a distribution certificate and an App Store provisioning profile:
+
+```sh
+cargo love2drs ios package --identity "Apple Distribution: Me (TEAMID)" --profile game.mobileprovision
+```
+
+This writes `<name>.ipa` and `<name>.app.dSYM` to `target/love2drs/ios/iphoneos/release/`. Upload the `.ipa` with
+Transporter or `xcrun altool`, and keep the `.dSYM` for reading crash reports. Without `--identity` the result is
+unsigned and needs signing before upload.
+
+The tool writes the `DT*` keys App Store Connect checks and a `PrivacyInfo.xcprivacy`. The one it makes declares no
+tracking, no data collection, and the required-reason system APIs it finds in the executable, with the reason
+for ordinary use inside an app. That's only a starting point: if the game collects data or has analytics, write
+your own and set `privacy_manifest`, and keep it consistent with what you tell App Store Connect.

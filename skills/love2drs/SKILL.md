@@ -86,12 +86,12 @@ the load closure. To return your own errors use `Error::custom(msg)`.
 
 **The frame loop**, in order:
 1. OS events are delivered to the event callbacks (`key_pressed`, `mouse_pressed`, `text_input`,
-   `wheel_moved`, `touch_pressed`/`touch_moved`/`touch_released`, `resize`, `focus`,
+   `wheel_moved`, `touch_pressed`/`touch_moved`/`touch_released`/`touch_cancelled`, `resize`, `focus`,
    `file_dropped`, `quit`), then controller events (`gamepad_added`/`removed`,
    `gamepad_pressed`/`released`, `gamepad_axis`).
 2. `update(ctx, dt)` runs. `dt` is in seconds and clamped to `Conf::max_dt` (0.25 by default).
 3. Per-frame input edges are cleared: `was_pressed`, `was_released`, `mouse.delta()`, `mouse.wheel()`,
-   touch deltas and `ctx.touch.released()`.
+   touch deltas, `ctx.touch.released()` and `ctx.touch.cancelled()`.
 4. The screen is cleared to the background color, the transform is reset, and `draw(ctx)` runs.
 5. The frame is submitted and presented (vsync on by default). While the window is minimized
    the loop keeps running, capped at 30 fps (`ctx.window.is_minimized()` to pause).
@@ -174,9 +174,8 @@ thousands. Check `g.stats().draw_calls`.
 - **Audio**: a `Source` is one voice, and calling `play()` while it is already playing does
   nothing. Use `play_overlapping()` for sound effects that can overlap. Files are fully decoded
   into memory (no streaming), so very long music costs RAM. With no audio device the game still
-  runs and sound is silent.
-- **No built-in** physics, ECS, scene graph, filesystem or save-dir module, networking,
-  Android/iOS packaging, or WASM. Use plain Rust (`std::fs`, `include_bytes!`, your own structs) or other crates.
+  runs and sound is silent. Sound comes back by itself if a device goes away and returns.
+- **No built-in** physics, ECS, scene graph, networking or WASM. Use plain Rust (`std::fs`, `include_bytes!`, your own structs) or other crates.
   `love2drs::run` can only be called once per process.
 - **Assets**: relative paths resolve against the *current working directory*, which is the
   directory you run `cargo run` from. That is usually the package root, not `src/`. To ship a
@@ -222,7 +221,9 @@ thousands. Check `g.stats().draw_calls`.
 Put `love2drs::android_main!(main);` next to `fn main`, then use the `cargo-love2drs` tool:
 `cargo love2drs android run` or `cargo love2drs ios run` (iOS needs macOS). Add `--example <name>`,
 `--bin <name>` or `--release` as needed. App settings and the assets to package go under
-`[package.metadata.love2drs]` in `Cargo.toml`; see recipe 14.
+`[package.metadata.love2drs]` in `Cargo.toml`; see recipe 14. For the stores,
+`cargo love2drs android package` makes an `.aab` for Google Play and `cargo love2drs ios package` makes
+an `.ipa` and `.dSYM` for the App Store; see recipe 15.
 
 When a game should run on phones:
 
@@ -231,12 +232,22 @@ When a game should run on phones:
 - Load files with love2drs loaders or `love2drs::filesystem::read`. `std::fs::read` can't see packaged assets.
 - Save in `Game::suspended`. The OS may end a backgrounded app without another callback.
 - Android's back gesture is `Key::Escape`, and the first finger also acts as the left mouse button.
+- The OS can take a finger away (a back gesture, a call, the notification shade, losing focus). That sends
+  `touch_cancelled` and, for the first finger, `mouse_cancelled`, not `touch_released` or `mouse_released`.
+  **If the game acts on release, forget the pending press in these callbacks** and don't act on it.
+- Sound stops while the app is in the background or paused and carries on by itself afterwards. On iOS it mixes
+  with the player's music by default, and `ctx.audio.set_session(AudioSession::Playback)` changes that.
+- On Android, Vulkan is used if the device has a driver and OpenGL ES 3 otherwise.
 - `ctx.gamepad` and rumble work as on desktop. Check `is_vibration_supported()` before relying on rumble.
 - `ctx.keyboard.set_screen_keyboard(true)` opens the on-screen keyboard. Read typing from `text_input`, and
   `Key::Backspace` and `Key::Enter` from `key_pressed`. `safe_area()` shrinks while it's up, and the user can
   close it without the game finding out. Android only delivers text that maps to key presses, so emoji, other
   scripts and autocorrect may not arrive.
 - Set `icon = "path/to/square.png"` under `[package.metadata.love2drs]` for the app icon.
+- `orientation = "landscape"` also holds on Android 16 tablets because the tool marks apps as games
+  (`app_category`, default `"game"`). Setting it to anything else, or `"none"`, lets those tablets ignore it.
+- A GPU error no longer panics. One-off errors are logged, out-of-memory also calls `low_memory`, and errors that
+  last 60 frames in a row or a lost GPU device end the game with an `Error::Graphics` from `love2drs::run`.
 
 ## Verifying your work
 

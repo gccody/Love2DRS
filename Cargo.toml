@@ -20,7 +20,7 @@ default-members = ["."]
 [features]
 default = ["audio", "gamepad", "png", "jpeg"]
 ## Sound playback via rodio (wav, ogg/vorbis, mp3, flac).
-audio = ["dep:rodio"]
+audio = ["dep:rodio", "dep:objc2-avf-audio", "dep:block2"]
 ## Gamepad input via gilrs. On Linux, building it needs the libudev headers
 ## (`libudev-dev` on Debian/Ubuntu, `systemd-devel` on Fedora). On Windows and
 ## macOS it also pulls in hidapi to drive PlayStation controllers directly.
@@ -56,12 +56,15 @@ android_logger = "0.15"
 jni = "0.21"
 
 # Apple's frameworks on iOS: UIKit for the keyboard's size, GameController and
-# CoreHaptics for controllers, which gilrs doesn't support there.
+# CoreHaptics for controllers, which gilrs doesn't support there, and AVFAudio for
+# the audio session, which rodio and cpal leave to the app.
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-game-controller = { version = "0.3", optional = true, features = ["objc2-core-haptics"] }
 objc2-core-haptics = { version = "0.3", optional = true }
+objc2-avf-audio = { version = "0.3", optional = true }
+block2 = { version = "0.6", optional = true }
 
 # Dependencies (wgpu, image decoding, audio) are compiled with optimizations even in
 # debug builds of the examples so they stay smooth while iterating.

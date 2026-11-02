@@ -9,6 +9,7 @@ use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 use crate::graphics::Graphics;
 use crate::input::gamepad::GamepadEvent;
+use crate::input::touch::{MouseAction, MouseFinger};
 use crate::input::{
     GamepadAxis, GamepadButton, GamepadId, Gamepads, Key, Keyboard, Mouse, MouseButton, Touch,
     TouchId,
@@ -76,6 +77,12 @@ pub trait Game: 'static {
     /// A mouse button was released at `(x, y)` in logical pixels.
     fn mouse_released(&mut self, ctx: &mut Context, x: f32, y: f32, button: MouseButton) {}
 
+    /// A held button ended without being let go, so it isn't a click. This only
+    /// happens on mobile, where the first finger acts as the left button, when
+    /// that finger gets [`touch_cancelled`](Game::touch_cancelled). Mouse-only
+    /// games should forget the press here. `mouse_released` won't follow.
+    fn mouse_cancelled(&mut self, ctx: &mut Context, x: f32, y: f32, button: MouseButton) {}
+
     /// The cursor moved to `(x, y)`; `(dx, dy)` is the movement since the last event.
     fn mouse_moved(&mut self, ctx: &mut Context, x: f32, y: f32, dx: f32, dy: f32) {}
 
@@ -89,9 +96,17 @@ pub trait Game: 'static {
     /// A finger moved to `(x, y)`; `(dx, dy)` is the movement since the last event.
     fn touch_moved(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32, dx: f32, dy: f32) {}
 
-    /// A finger left the screen at `(x, y)`. Also sent when the OS cancels a
-    /// touch, for example when a system gesture takes over.
+    /// A finger left the screen at `(x, y)`. Only sent when the player really
+    /// lifted it, so this is a safe place to act on a tap. See
+    /// [`touch_cancelled`](Game::touch_cancelled) for the other way a touch ends.
     fn touch_released(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32) {}
+
+    /// The OS took a finger away at `(x, y)`, for example for a back gesture, an
+    /// incoming call or the notification shade. It also happens to every finger
+    /// when the window loses focus or the app is suspended. The player didn't
+    /// mean to let go, so forget the touch and don't act on it, as you would for
+    /// a drag dropped outside any target.
+    fn touch_cancelled(&mut self, ctx: &mut Context, id: TouchId, x: f32, y: f32) {}
 
     /// A controller was connected. Controllers already plugged in at startup
     /// are announced before the first `update`.
@@ -114,7 +129,8 @@ pub trait Game: 'static {
     fn resize(&mut self, ctx: &mut Context, width: f32, height: f32) {}
 
     /// The window gained (`true`) or lost (`false`) keyboard focus. Held keys and
-    /// buttons are released when focus is lost.
+    /// buttons are released when focus is lost, and fingers get
+    /// [`touch_cancelled`](Game::touch_cancelled).
     fn focus(&mut self, ctx: &mut Context, focused: bool) {}
 
     /// The app went to the background on Android or iOS, or a system overlay
@@ -186,9 +202,11 @@ where
         autoshot: AutoShot::from_env(),
         last_frame: Instant::now(),
         suspended: false,
-        mouse_finger: None,
+        mouse_finger: MouseFinger::default(),
         #[cfg(target_os = "android")]
         android_input: Default::default(),
+        #[cfg(target_os = "android")]
+        android_pause: PauseDetector::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -287,9 +305,50 @@ struct App<G, F> {
     /// The app is in the background, so nothing may be drawn.
     suspended: bool,
     /// The finger that acts as the mouse on mobile.
-    mouse_finger: Option<TouchId>,
+    mouse_finger: MouseFinger,
     #[cfg(target_os = "android")]
     android_input: crate::input::android::Reader,
+    #[cfg(target_os = "android")]
+    android_pause: PauseDetector,
+}
+
+/// Notices when Android pauses the app without taking its window, as it does
+/// behind a permission dialog. winit keeps that to itself and `suspended` doesn't
+/// fire, but it also holds back redraws until the app resumes. Since every pass of
+/// the loop asks for one, a pass that ends with the last one undelivered means the
+/// app is paused.
+#[cfg(any(target_os = "android", test))]
+#[derive(Default)]
+struct PauseDetector {
+    redraw_requested: bool,
+    paused: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PauseDetector {
+    /// The loop is about to ask for a redraw. Returns whether this is the moment
+    /// the app turned out to be paused.
+    fn about_to_wait(&mut self) -> bool {
+        let just_paused = self.redraw_requested && !self.paused;
+        self.paused |= just_paused;
+        self.redraw_requested = true;
+        just_paused
+    }
+
+    /// A frame is running. Returns whether the app was paused until now.
+    fn frame_drawn(&mut self) -> bool {
+        self.redraw_requested = false;
+        std::mem::take(&mut self.paused)
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// The window came or went, which says nothing about redraws asked for before.
+    fn forget_redraw(&mut self) {
+        self.redraw_requested = false;
+    }
 }
 
 /// Frame interval while the window is minimized (30 fps).
@@ -357,6 +416,12 @@ where
             return;
         };
         self.last_frame = Instant::now();
+        #[cfg(target_os = "android")]
+        if self.android_pause.frame_drawn() {
+            log::info!("Android resumed the app");
+            #[cfg(feature = "audio")]
+            ctx.audio.set_hold(crate::audio::Hold::Paused, false);
+        }
         poll_gamepads(ctx, game);
         let dt = ctx.timer.step();
         game.update(ctx, dt);
@@ -373,6 +438,13 @@ where
             ctx.graphics.capture_screenshot(path.clone());
         }
         ctx.graphics.end_frame();
+        if ctx.graphics.take_out_of_memory() {
+            game.low_memory(ctx);
+        }
+        if let Some(error) = ctx.graphics.take_fatal_error() {
+            self.fail(event_loop, error);
+            return;
+        }
 
         if self.autoshot.path.is_some() && ctx.timer.frame_count() >= self.autoshot.frame {
             exit_app(event_loop);
@@ -400,9 +472,14 @@ where
                     game.touch_moved(ctx, id, x, y, d.x, d.y);
                 }
             }
-            TouchPhase::Ended | TouchPhase::Cancelled => {
+            TouchPhase::Ended => {
                 if ctx.touch.end(id, vec2(x, y), pressure) {
                     game.touch_released(ctx, id, x, y);
+                }
+            }
+            TouchPhase::Cancelled => {
+                if ctx.touch.cancel(id, vec2(x, y), pressure) {
+                    game.touch_cancelled(ctx, id, x, y);
                 }
             }
         }
@@ -469,24 +546,43 @@ where
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
-        match phase {
-            TouchPhase::Started if self.mouse_finger.is_none() => {
-                self.mouse_finger = Some(id);
+        match self.mouse_finger.route(id, phase) {
+            Some(MouseAction::Press) => {
                 let d = ctx.mouse.moved(vec2(x, y));
                 game.mouse_moved(ctx, x, y, d.x, d.y);
                 ctx.mouse.press(MouseButton::Left);
                 game.mouse_pressed(ctx, x, y, MouseButton::Left);
             }
-            TouchPhase::Moved if self.mouse_finger == Some(id) => {
+            Some(MouseAction::Move) => {
                 let d = ctx.mouse.moved(vec2(x, y));
                 game.mouse_moved(ctx, x, y, d.x, d.y);
             }
-            TouchPhase::Ended | TouchPhase::Cancelled if self.mouse_finger == Some(id) => {
-                self.mouse_finger = None;
+            Some(MouseAction::Release) => {
                 ctx.mouse.release(MouseButton::Left);
                 game.mouse_released(ctx, x, y, MouseButton::Left);
             }
-            _ => {}
+            Some(MouseAction::Cancel) => {
+                ctx.mouse.cancel(MouseButton::Left);
+                game.mouse_cancelled(ctx, x, y, MouseButton::Left);
+            }
+            None => {}
+        }
+    }
+
+    /// Ends every finger without a release, for when focus is lost or the app is
+    /// suspended. Lifting them later does nothing, as they're already gone.
+    fn cancel_touches(&mut self) {
+        let Some((ctx, game)) = &mut self.state else {
+            return;
+        };
+        let mouse_finger = self.mouse_finger.take();
+        for t in ctx.touch.cancel_all() {
+            let (x, y) = (t.position.x, t.position.y);
+            game.touch_cancelled(ctx, t.id, x, y);
+            if mouse_finger == Some(t.id) {
+                ctx.mouse.cancel(MouseButton::Left);
+                game.mouse_cancelled(ctx, x, y, MouseButton::Left);
+            }
         }
     }
 
@@ -512,11 +608,15 @@ where
             return;
         }
         self.suspended = false;
+        #[cfg(target_os = "android")]
+        self.android_pause.forget_redraw();
         let result = match &mut self.state {
             None => self.init(event_loop),
             Some((ctx, game)) => ctx.graphics.resume().map(|()| {
+                #[cfg(all(feature = "audio", target_os = "ios"))]
+                ctx.audio.end_interruption();
                 #[cfg(feature = "audio")]
-                crate::audio::set_suspended(false);
+                ctx.audio.set_hold(crate::audio::Hold::Background, false);
                 game.resumed(ctx);
             }),
         };
@@ -532,17 +632,18 @@ where
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.suspended = true;
+        #[cfg(target_os = "android")]
+        self.android_pause.forget_redraw();
+        self.cancel_touches();
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
-        self.mouse_finger = None;
         #[cfg(any(target_os = "android", target_os = "ios"))]
         ctx.gamepad.suspend();
         ctx.keyboard.release_all();
         ctx.mouse.release_all();
-        ctx.touch.release_all();
         #[cfg(feature = "audio")]
-        crate::audio::set_suspended(true);
+        ctx.audio.set_hold(crate::audio::Hold::Background, true);
         game.suspended(ctx);
         ctx.graphics.suspend();
     }
@@ -581,9 +682,14 @@ where
             }
             WindowEvent::Focused(focused) => {
                 if !focused {
+                    self.cancel_touches();
+                }
+                let Some((ctx, game)) = &mut self.state else {
+                    return;
+                };
+                if !focused {
                     ctx.keyboard.release_all();
                     ctx.mouse.release_all();
-                    ctx.touch.release_all();
                 }
                 game.focus(ctx, focused);
             }
@@ -660,13 +766,29 @@ where
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some((ctx, _)) = &self.state else {
+        let Some((ctx, _)) = &mut self.state else {
             return;
         };
+        #[cfg(feature = "audio")]
+        ctx.audio.poll();
         // The OS forbids drawing in the background. Sleep until `resumed`.
         if self.suspended {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
+        }
+        #[cfg(target_os = "android")]
+        {
+            if self.android_pause.about_to_wait() {
+                log::info!("Android paused the app without taking its window");
+                #[cfg(feature = "audio")]
+                ctx.audio.set_hold(crate::audio::Hold::Paused, true);
+            }
+            // winit remembers the redraw asked for before the pause and sends it
+            // when the app resumes, so nothing else has to wake this up.
+            if self.android_pause.is_paused() {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                return;
+            }
         }
         // Nothing is presented while minimized, so vsync no longer paces the
         // loop. Keep the game running, but at a capped rate.
@@ -679,5 +801,41 @@ where
         }
         event_loop.set_control_flow(ControlFlow::Poll);
         ctx.window.inner.request_redraw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_arriving_means_not_paused() {
+        let mut d = PauseDetector::default();
+        for _ in 0..5 {
+            assert!(!d.about_to_wait());
+            assert!(!d.frame_drawn());
+            assert!(!d.is_paused());
+        }
+    }
+
+    #[test]
+    fn a_redraw_that_never_comes_means_paused_until_the_next_frame() {
+        let mut d = PauseDetector::default();
+        assert!(!d.about_to_wait());
+        assert!(d.about_to_wait(), "reported once");
+        assert!(d.is_paused());
+        assert!(!d.about_to_wait(), "reported once");
+        assert!(d.is_paused());
+        assert!(d.frame_drawn());
+        assert!(!d.is_paused());
+    }
+
+    #[test]
+    fn losing_the_window_is_not_a_pause() {
+        let mut d = PauseDetector::default();
+        d.about_to_wait();
+        d.forget_redraw();
+        assert!(!d.about_to_wait());
+        assert!(!d.is_paused());
     }
 }

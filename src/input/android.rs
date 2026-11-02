@@ -19,6 +19,10 @@ use super::{GamepadButton, Key};
 /// often reported with a combined source such as gamepad + keyboard.
 const SOURCE_GAMEPAD_BIT: u32 = 0x400;
 
+/// `MotionEvent.FLAG_CANCELED`: since Android 13, a finger going up with this
+/// flag was rejected, for example as a palm, and shouldn't count as a tap.
+const FLAG_CANCELED: u32 = 0x20;
+
 pub(crate) enum Event {
     Touch {
         id: u64,
@@ -148,8 +152,12 @@ fn read_motion(event: &MotionEvent<'_>, on_event: &mut impl FnMut(Event)) -> Inp
         }));
         return InputStatus::Handled;
     }
-    let phase = match event.action() {
+    let action = event.action();
+    let phase = match action {
         MotionAction::Down | MotionAction::PointerDown => TouchPhase::Started,
+        MotionAction::Up | MotionAction::PointerUp if event.flags().0 & FLAG_CANCELED != 0 => {
+            TouchPhase::Cancelled
+        }
         MotionAction::Up | MotionAction::PointerUp => TouchPhase::Ended,
         MotionAction::Move => TouchPhase::Moved,
         MotionAction::Cancel => TouchPhase::Cancelled,
@@ -164,7 +172,11 @@ fn read_motion(event: &MotionEvent<'_>, on_event: &mut impl FnMut(Event)) -> Inp
             pressure,
         })
     };
-    if matches!(phase, TouchPhase::Started | TouchPhase::Ended) {
+    // These name one finger. Moves and `Cancel` are about all of them.
+    if matches!(
+        action,
+        MotionAction::Down | MotionAction::PointerDown | MotionAction::Up | MotionAction::PointerUp
+    ) {
         let p = event.pointer_at_index(event.pointer_index());
         send(p.pointer_id(), p.x(), p.y(), p.pressure());
     } else {

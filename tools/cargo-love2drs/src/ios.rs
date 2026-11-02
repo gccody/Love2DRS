@@ -1,4 +1,5 @@
-//! Packages a game as an iOS `.app` bundle with Xcode's command line tools.
+//! Packages a game as an iOS `.app` bundle with Xcode's command line tools, and
+//! for the App Store as an `.ipa` with its debug symbols in a `.dSYM`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,14 +11,22 @@ pub fn main(project: &Project, options: &Options, action: Action) -> Result<(), 
     if !cfg!(target_os = "macos") {
         return Err("iOS apps can only be built on macOS, because linking needs Xcode".into());
     }
-    if action != Action::Build && options.physical && options.identity.is_none() {
+    let installing = matches!(action, Action::Install | Action::Run);
+    if installing && options.physical && options.identity.is_none() {
         return Err("installing on a real device needs --identity and --profile".into());
     }
     if options.identity.is_some() != options.profile.is_some() {
         return Err("--identity and --profile only work together".into());
     }
-    let app = build_app(project, options)?;
+    let store = action == Action::Package;
+    let app = build_app(project, options, store)?;
     println!("Built {}", app.display());
+    if store {
+        let ipa = write_ipa(project, &app)?;
+        println!("Built {}", ipa.display());
+        println!("Built {}", dsym_path(&app).display());
+        return Ok(());
+    }
     if action == Action::Build {
         return Ok(());
     }
@@ -68,10 +77,11 @@ fn rust_target(options: &Options) -> &'static str {
     }
 }
 
-fn build_app(project: &Project, options: &Options) -> Result<PathBuf, String> {
+/// `store` also keeps debug symbols aside and strips them from the app.
+fn build_app(project: &Project, options: &Options, store: bool) -> Result<PathBuf, String> {
     let triple = rust_target(options);
     project::require_rust_target(triple)?;
-    let exe = compile(project, options, triple)?;
+    let exe = compile(project, options, triple, store)?;
 
     let platform = if options.physical {
         "iphoneos"
@@ -85,8 +95,25 @@ fn build_app(project: &Project, options: &Options) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&app).map_err(|e| format!("{}: {e}", app.display()))?;
 
-    copy(&exe, &app.join(&project.name))?;
-    let plist = info_plist(project, options.physical);
+    let app_exe = app.join(&project.name);
+    copy(&exe, &app_exe)?;
+    let build_info = options.physical.then(BuildInfo::find).transpose()?;
+    if store {
+        keep_symbols(&exe, &app)?;
+        if let Some(info) = &build_info {
+            warn_about_old_sdk(info);
+        }
+    }
+    write_privacy_manifest(project, &app_exe, &app)?;
+    if store {
+        run(
+            Command::new("xcrun")
+                .args(["strip", "-S", "-x"])
+                .arg(&app_exe),
+            "",
+        )?;
+    }
+    let plist = info_plist(project, options.physical, build_info.as_ref());
     std::fs::write(app.join("Info.plist"), plist).map_err(|e| format!("Info.plist: {e}"))?;
     for (file, app_path) in project.asset_files()? {
         let dest = app.join(app_path);
@@ -100,6 +127,276 @@ fn build_app(project: &Project, options: &Options) -> Result<PathBuf, String> {
     }
     sign(&app, options)?;
     Ok(app)
+}
+
+/// Xcode and SDK facts that the App Store expects in `Info.plist`. Xcode normally
+/// writes them, and App Store Connect reads them to tell what built the app.
+struct BuildInfo {
+    sdk_version: String,
+    sdk_build: String,
+    xcode_version: String,
+    xcode_build: String,
+    machine_os_build: String,
+}
+
+impl BuildInfo {
+    fn find() -> Result<BuildInfo, String> {
+        let ask = |program: &str, args: &[&str]| {
+            capture(Command::new(program).args(args)).ok_or(format!(
+                "can't run `{program} {}`; is Xcode installed?",
+                args.join(" ")
+            ))
+        };
+        let sdk = ["--sdk", "iphoneos"];
+        let sdk_args = |flag: &'static str| [sdk[0], sdk[1], flag];
+        let xcodebuild = ask("xcodebuild", &["-version"])?;
+        let (xcode_version, xcode_build) = parse_xcodebuild_version(&xcodebuild)
+            .ok_or(format!("can't read Xcode's version from `{xcodebuild}`"))?;
+        Ok(BuildInfo {
+            sdk_version: ask("xcrun", &sdk_args("--show-sdk-version"))?,
+            sdk_build: ask("xcrun", &sdk_args("--show-sdk-build-version"))?,
+            xcode_version,
+            xcode_build,
+            machine_os_build: ask("sw_vers", &["-buildVersion"])?,
+        })
+    }
+
+    fn plist_entries(&self) -> String {
+        let entries = [
+            ("BuildMachineOSBuild", self.machine_os_build.clone()),
+            (
+                "DTCompiler",
+                "com.apple.compilers.llvm.clang.1_0".to_string(),
+            ),
+            ("DTPlatformBuild", self.sdk_build.clone()),
+            ("DTPlatformName", "iphoneos".to_string()),
+            ("DTPlatformVersion", self.sdk_version.clone()),
+            ("DTSDKBuild", self.sdk_build.clone()),
+            ("DTSDKName", format!("iphoneos{}", self.sdk_version)),
+            ("DTXcode", dt_xcode(&self.xcode_version)),
+            ("DTXcodeBuild", self.xcode_build.clone()),
+        ];
+        entries
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "    <key>{key}</key>\n    <string>{}</string>\n",
+                    xml_escape(value)
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reads `Xcode 27.2\nBuild version 27B52`.
+fn parse_xcodebuild_version(text: &str) -> Option<(String, String)> {
+    let mut lines = text.lines();
+    let version = lines.next()?.strip_prefix("Xcode ")?.trim();
+    let build = lines.next()?.strip_prefix("Build version ")?.trim();
+    Some((version.to_string(), build.to_string()))
+}
+
+/// `DTXcode` is the version without dots, padded: `26.0.1` is `2601`, `16.4` is `1640`.
+fn dt_xcode(version: &str) -> String {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    format!("{major:02}{minor}{patch}")
+}
+
+/// What App Store Connect has required since April 28, 2026.
+const APP_STORE_MIN_SDK: u32 = 26;
+
+fn warn_about_old_sdk(info: &BuildInfo) {
+    let major = info.sdk_version.split('.').next().unwrap_or("");
+    if major.parse::<u32>().is_ok_and(|v| v < APP_STORE_MIN_SDK) {
+        println!(
+            "warning: the App Store requires the iOS {APP_STORE_MIN_SDK} SDK or newer, and this \
+             Xcode has {}",
+            info.sdk_version
+        );
+    }
+}
+
+fn dsym_path(app: &Path) -> PathBuf {
+    let name = app.file_name().unwrap_or_default().to_string_lossy();
+    app.with_file_name(format!("{name}.dSYM"))
+}
+
+/// Puts the debug symbols rustc wrote where they're easy to find. Upload them to
+/// make sense of crash reports.
+fn keep_symbols(exe: &Path, app: &Path) -> Result<(), String> {
+    let mut symbols = exe.as_os_str().to_os_string();
+    symbols.push(".dSYM");
+    let symbols = PathBuf::from(symbols);
+    if !symbols.exists() {
+        return Err(format!(
+            "the build left no symbols at {}",
+            symbols.display()
+        ));
+    }
+    let dsym = dsym_path(app);
+    if dsym.exists() {
+        std::fs::remove_dir_all(&dsym).map_err(|e| format!("{}: {e}", dsym.display()))?;
+    }
+    run(Command::new("ditto").arg(&symbols).arg(&dsym), "")
+}
+
+/// Zips the app the way the App Store takes it.
+fn write_ipa(project: &Project, app: &Path) -> Result<PathBuf, String> {
+    let dir = app.parent().ok_or("the app has no directory")?;
+    let ipa = dir.join(format!("{}.ipa", project.name));
+    if ipa.exists() {
+        std::fs::remove_file(&ipa).map_err(|e| format!("{}: {e}", ipa.display()))?;
+    }
+    let work = dir.join("ipa");
+    if work.exists() {
+        std::fs::remove_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    }
+    let name = app.file_name().ok_or("the app has no name")?;
+    let payload = work.join("Payload");
+    std::fs::create_dir_all(&payload).map_err(|e| format!("{}: {e}", payload.display()))?;
+    // `ditto` keeps what the code signature covers exactly as it is.
+    run(Command::new("ditto").arg(app).arg(payload.join(name)), "")?;
+    run(
+        Command::new("zip")
+            .current_dir(&work)
+            .args(["-qry"])
+            .arg(&ipa)
+            .arg("Payload"),
+        "",
+    )?;
+    std::fs::remove_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    Ok(ipa)
+}
+
+/// A system API that Apple requires a reason for, how to spot it in an executable,
+/// and the reason that fits a game using it the ordinary way.
+struct RequiredReasonApi {
+    category: &'static str,
+    reason: &'static str,
+    symbols: &'static [&'static str],
+}
+
+/// Rust's standard library and common crates use some of these without a game
+/// knowing. The reasons are for use within the app itself.
+const REQUIRED_REASON_APIS: [RequiredReasonApi; 4] = [
+    RequiredReasonApi {
+        category: "NSPrivacyAccessedAPICategoryFileTimestamp",
+        // Files inside the app's own container.
+        reason: "C617.1",
+        symbols: &[
+            "_stat",
+            "_fstat",
+            "_lstat",
+            "_fstatat",
+            "_getattrlist",
+            "_fgetattrlist",
+            "_getattrlistat",
+            "_getattrlistbulk",
+        ],
+    },
+    RequiredReasonApi {
+        category: "NSPrivacyAccessedAPICategorySystemBootTime",
+        // Measuring time between events within the app.
+        reason: "35F9.1",
+        symbols: &["_mach_absolute_time"],
+    },
+    RequiredReasonApi {
+        category: "NSPrivacyAccessedAPICategoryDiskSpace",
+        // Checking there's room to write files.
+        reason: "E174.1",
+        symbols: &["_statfs", "_statvfs", "_fstatfs", "_fstatvfs"],
+    },
+    RequiredReasonApi {
+        category: "NSPrivacyAccessedAPICategoryUserDefaults",
+        // Data only the app itself reads and writes.
+        reason: "CA92.1",
+        symbols: &["_OBJC_CLASS_$_NSUserDefaults"],
+    },
+];
+
+/// Which required-reason APIs appear in the output of `nm -u`.
+fn apis_in_use(undefined_symbols: &str) -> Vec<&'static RequiredReasonApi> {
+    let symbols: Vec<&str> = undefined_symbols
+        .lines()
+        // Versions of a function have a suffix, like `_stat$INODE64`.
+        .map(|line| line.trim().split('$').next().unwrap_or(""))
+        .collect();
+    let objc: Vec<&str> = undefined_symbols.lines().map(str::trim).collect();
+    REQUIRED_REASON_APIS
+        .iter()
+        .filter(|api| {
+            api.symbols
+                .iter()
+                .any(|symbol| symbols.contains(symbol) || objc.contains(symbol))
+        })
+        .collect()
+}
+
+/// Writes the privacy manifest the App Store asks for.
+fn privacy_manifest_xml(apis: &[&RequiredReasonApi]) -> String {
+    let accessed: String = apis
+        .iter()
+        .map(|api| {
+            format!(
+                r#"        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>{}</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>{}</string>
+            </array>
+        </dict>
+"#,
+                api.category, api.reason
+            )
+        })
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSPrivacyTracking</key>
+    <false/>
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+{accessed}    </array>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Copies the game's own privacy manifest, or makes one from what the executable
+/// uses. A made one can't know what the game does with the player's data, so it
+/// says so.
+fn write_privacy_manifest(project: &Project, exe: &Path, app: &Path) -> Result<(), String> {
+    let dest = app.join("PrivacyInfo.xcprivacy");
+    if let Some(manifest) = &project.privacy_manifest {
+        return copy(&project.root.join(manifest), &dest);
+    }
+    let symbols = capture(Command::new("xcrun").args(["nm", "-u"]).arg(exe))
+        .ok_or("can't list the system APIs the game uses")?;
+    let apis = apis_in_use(&symbols);
+    let categories: Vec<&str> = apis.iter().map(|api| api.category).collect();
+    println!(
+        "note: made a privacy manifest declaring {} and no tracking or data collection. If the \
+         game collects data, set `privacy_manifest` in Cargo.toml.",
+        if categories.is_empty() {
+            "no required-reason APIs".to_string()
+        } else {
+            categories.join(", ")
+        }
+    );
+    std::fs::write(&dest, privacy_manifest_xml(&apis))
+        .map_err(|e| format!("{}: {e}", dest.display()))
 }
 
 /// Compiles the icon with Xcode's asset catalog compiler, which writes it into
@@ -172,15 +469,29 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", from.display()))
 }
 
-/// Compiles the game and returns the executable Cargo reports.
-fn compile(project: &Project, options: &Options, triple: &str) -> Result<PathBuf, String> {
-    let output = Command::new(project::cargo())
+/// Compiles the game and returns the executable Cargo reports. `store` also makes
+/// rustc leave a `.dSYM` next to it, however the game's release profile is set up.
+fn compile(
+    project: &Project,
+    options: &Options,
+    triple: &str,
+    store: bool,
+) -> Result<PathBuf, String> {
+    let mut cargo = Command::new(project::cargo());
+    cargo
         .current_dir(&project.root)
         .arg("build")
         .args(options.cargo_args(project))
         .args(["--target", triple])
         .arg("--message-format=json-render-diagnostics")
-        .env("IPHONEOS_DEPLOYMENT_TARGET", &project.ios_deployment_target)
+        .env("IPHONEOS_DEPLOYMENT_TARGET", &project.ios_deployment_target);
+    if store {
+        cargo
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "line-tables-only")
+            .env("CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO", "packed")
+            .env("CARGO_PROFILE_RELEASE_STRIP", "none");
+    }
+    let output = cargo
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("can't run cargo: {e}"))?;
@@ -190,7 +501,7 @@ fn compile(project: &Project, options: &Options, triple: &str) -> Result<PathBuf
     project::built_executable(&output.stdout, &project.name)
 }
 
-fn info_plist(project: &Project, physical: bool) -> String {
+fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>) -> String {
     let landscape = [
         "UIInterfaceOrientationLandscapeLeft",
         "UIInterfaceOrientationLandscapeRight",
@@ -216,6 +527,7 @@ fn info_plist(project: &Project, physical: bool) -> String {
     let version = xml_escape(&project.version);
     let code = project.version_code;
     let min_os = xml_escape(&project.ios_deployment_target);
+    let build_info = build_info.map(BuildInfo::plist_entries).unwrap_or_default();
     // An empty `UILaunchScreen` is what asks for the whole screen. Without one,
     // iOS runs the app letterboxed at an old iPhone's resolution.
     format!(
@@ -223,7 +535,7 @@ fn info_plist(project: &Project, physical: bool) -> String {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
+{build_info}    <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
     <string>{name}</string>
@@ -422,13 +734,15 @@ mod tests {
             target_sdk: 36,
             permissions: vec![],
             icon: None,
+            app_category: Some("game".into()),
             ios_deployment_target: "15.0".into(),
+            privacy_manifest: None,
         }
     }
 
     #[test]
     fn plist_fills_in_the_project() {
-        let plist = info_plist(&project(Orientation::Any), false);
+        let plist = info_plist(&project(Orientation::Any), false, None);
         assert!(plist.contains("<string>com.example.my-game</string>"));
         assert!(plist.contains("<string>Tom &amp; Jerry</string>"));
         assert!(plist.contains("<string>iPhoneSimulator</string>"));
@@ -438,9 +752,77 @@ mod tests {
 
     #[test]
     fn plist_limits_orientation() {
-        let plist = info_plist(&project(Orientation::Landscape), true);
+        let plist = info_plist(&project(Orientation::Landscape), true, None);
         assert!(plist.contains("<string>iPhoneOS</string>"));
         assert!(!plist.contains("UIInterfaceOrientationPortrait"));
+    }
+
+    #[test]
+    fn plist_records_what_built_the_app() {
+        let info = BuildInfo {
+            sdk_version: "26.2".into(),
+            sdk_build: "23C53".into(),
+            xcode_version: "26.2".into(),
+            xcode_build: "17C52".into(),
+            machine_os_build: "25C56".into(),
+        };
+        let plist = info_plist(&project(Orientation::Any), true, Some(&info));
+        for expected in [
+            "<key>DTSDKName</key>\n    <string>iphoneos26.2</string>",
+            "<key>DTPlatformName</key>\n    <string>iphoneos</string>",
+            "<key>DTPlatformVersion</key>\n    <string>26.2</string>",
+            "<key>DTPlatformBuild</key>\n    <string>23C53</string>",
+            "<key>DTSDKBuild</key>\n    <string>23C53</string>",
+            "<key>DTXcode</key>\n    <string>2620</string>",
+            "<key>DTXcodeBuild</key>\n    <string>17C52</string>",
+            "<key>BuildMachineOSBuild</key>\n    <string>25C56</string>",
+            "<key>DTCompiler</key>",
+        ] {
+            assert!(plist.contains(expected), "missing {expected}");
+        }
+        assert!(!info_plist(&project(Orientation::Any), true, None).contains("DTSDKName"));
+    }
+
+    #[test]
+    fn xcode_versions_read_the_way_xcode_writes_them() {
+        assert_eq!(dt_xcode("26.0.1"), "2601");
+        assert_eq!(dt_xcode("16.4"), "1640");
+        assert_eq!(dt_xcode("27"), "2700");
+        assert_eq!(dt_xcode("9.4"), "0940");
+        assert_eq!(
+            parse_xcodebuild_version("Xcode 27.2\nBuild version 27B52"),
+            Some(("27.2".to_string(), "27B52".to_string()))
+        );
+        assert_eq!(parse_xcodebuild_version("nonsense"), None);
+    }
+
+    #[test]
+    fn privacy_manifest_lists_only_the_apis_found() {
+        let apis = apis_in_use("_malloc\n_stat$INODE64\n_mach_absolute_time\n");
+        let found: Vec<&str> = apis.iter().map(|a| a.category).collect();
+        assert_eq!(
+            found,
+            [
+                "NSPrivacyAccessedAPICategoryFileTimestamp",
+                "NSPrivacyAccessedAPICategorySystemBootTime",
+            ]
+        );
+        assert!(apis_in_use("_malloc\n_statistics\n").is_empty());
+        assert_eq!(apis_in_use("_OBJC_CLASS_$_NSUserDefaults\n").len(), 1);
+
+        let xml = privacy_manifest_xml(&apis);
+        assert!(xml.contains("<key>NSPrivacyTracking</key>\n    <false/>"));
+        assert!(xml.contains("<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>"));
+        assert!(xml.contains("<string>C617.1</string>"));
+        assert!(!xml.contains("DiskSpace"));
+    }
+
+    #[test]
+    fn dsym_sits_next_to_the_app() {
+        assert_eq!(
+            dsym_path(Path::new("out/game.app")),
+            Path::new("out/game.app.dSYM")
+        );
     }
 
     #[test]

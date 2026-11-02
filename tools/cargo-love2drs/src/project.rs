@@ -61,7 +61,11 @@ pub struct Project {
     pub min_sdk: u64,
     pub target_sdk: u64,
     pub permissions: Vec<String>,
+    /// What Android files the app under, or `None` to leave it out of the manifest.
+    pub app_category: Option<String>,
     pub ios_deployment_target: String,
+    /// The game's own `PrivacyInfo.xcprivacy`, relative to the package root.
+    pub privacy_manifest: Option<PathBuf>,
 }
 
 impl Project {
@@ -106,6 +110,11 @@ impl Project {
             check_assets(&root, std::slice::from_ref(icon))?;
         }
 
+        let privacy_manifest = settings["privacy_manifest"].as_str().map(PathBuf::from);
+        if let Some(manifest) = &privacy_manifest {
+            check_assets(&root, std::slice::from_ref(manifest))?;
+        }
+
         let version = text(&package["version"]);
         let app_id = match settings["app_id"].as_str() {
             // Examples share the package's settings but are separate apps.
@@ -137,10 +146,12 @@ impl Project {
                 .as_array()
                 .map(|list| list.iter().map(text).collect())
                 .unwrap_or_default(),
+            app_category: parse_app_category(settings["app_category"].as_str())?,
             ios_deployment_target: settings["ios_deployment_target"]
                 .as_str()
                 .unwrap_or("15.0")
                 .to_string(),
+            privacy_manifest,
         })
     }
 
@@ -294,6 +305,31 @@ fn parse_orientation(value: Option<&str>) -> Result<Orientation, String> {
     }
 }
 
+/// `android:appCategory`. Games are the default here because Android 16 ignores
+/// a locked orientation on tablets unless the app says it's a game.
+fn parse_app_category(value: Option<&str>) -> Result<Option<String>, String> {
+    const CATEGORIES: [&str; 9] = [
+        "accessibility",
+        "audio",
+        "game",
+        "image",
+        "maps",
+        "news",
+        "productivity",
+        "social",
+        "video",
+    ];
+    match value {
+        None => Ok(Some("game".to_string())),
+        Some("none") => Ok(None),
+        Some(category) if CATEGORIES.contains(&category) => Ok(Some(category.to_string())),
+        Some(other) => Err(format!(
+            "app_category `{other}` should be none or one of {}",
+            CATEGORIES.join(", ")
+        )),
+    }
+}
+
 /// `1.2.3` becomes `10203`. Stores require a number that grows with each release.
 fn version_code(version: &str) -> u64 {
     let mut parts = version
@@ -404,6 +440,17 @@ mod tests {
         let demo = Target::Example("demo".into());
         assert_eq!(resolve_target(&package, &demo), Ok(demo));
         assert!(resolve_target(&package, &Target::Example("x".into())).is_err());
+    }
+
+    #[test]
+    fn app_category_defaults_to_game() {
+        assert_eq!(parse_app_category(None), Ok(Some("game".to_string())));
+        assert_eq!(parse_app_category(Some("none")), Ok(None));
+        assert_eq!(
+            parse_app_category(Some("social")),
+            Ok(Some("social".to_string()))
+        );
+        assert!(parse_app_category(Some("games")).is_err());
     }
 
     #[test]

@@ -157,6 +157,8 @@ cargo love2drs android run                    # on a connected phone or running 
 cargo love2drs android build --release        # makes an .apk for arm64 and x86_64
 cargo love2drs ios run                        # on the iOS Simulator
 cargo love2drs ios build --physical --release # makes an .app for a real iPhone or iPad
+cargo love2drs android package                # makes an .aab for Google Play
+cargo love2drs ios package                    # makes an .ipa and .dSYM for the App Store
 ```
 
 Add `--bin <name>` or `--example <name>` to choose what to build. Inside this repo no install is
@@ -184,7 +186,9 @@ version_code = 3                 # default: derived from the version, 1.2.3 beco
 min_sdk = 26                     # Android
 target_sdk = 36                  # Android
 permissions = ["android.permission.INTERNET"]  # Android
+app_category = "game"            # Android; the default. "none" leaves it out of the manifest
 ios_deployment_target = "15.0"   # iOS
+privacy_manifest = "ios/PrivacyInfo.xcprivacy"  # iOS; default: made for you, see below
 ```
 
 **How a phone differs from a desktop:**
@@ -195,6 +199,17 @@ ios_deployment_target = "15.0"   # iOS
   clipped on a phone; `examples/mobile.rs` is the one written for it.
 - **Touch is the main input.** The first finger also acts as the left mouse button, so mouse-only games
   work, and Android's back gesture arrives as `Key::Escape`.
+- **The OS can take a touch away**, for a back gesture, a call or the notification shade, and losing focus does the
+  same. That reaches `Game::touch_cancelled` and, for the first finger, `Game::mouse_cancelled`, and not the release
+  callbacks. `ctx.touch.cancelled()` and `ctx.mouse.was_cancelled()` report it too. A game that acts on release
+  should forget the pending press there.
+- **Orientation:** Android 16 ignores a locked orientation on tablets unless an app says it's a game, so the tool
+  sets `android:appCategory="game"` unless you choose another `app_category`. A landscape game is then letterboxed
+  when such a tablet is held upright.
+- **Graphics:** Android uses Vulkan where there's a driver and OpenGL ES 3 otherwise. A failure to start is an error
+  from `love2drs::run`, logged on Android, and not a panic. Later GPU errors are logged and forgiven unless they last
+  for 60 frames in a row, or the GPU device is lost, which ends the game with an error. A lost window surface is
+  recreated.
 - **Controllers** use the same `ctx.gamepad` API as on desktop, including rumble. Whether a controller
   can rumble depends on the controller and OS version, so check `is_vibration_supported()`. Android needs
   no permission prompt for this; the tool declares `VIBRATE` for you.
@@ -208,15 +223,31 @@ ios_deployment_target = "15.0"   # iOS
   see packaged files. The working directory is `love2drs::filesystem::save_dir()`, so writing to a relative path
   with `std::fs` saves there.
 - **The OS can end the app at any time** once it's in the background. `Game::suspended` is your last chance to
-  save. `update` and `draw` stop and sounds are silenced until `Game::resumed`.
+  save. `update` and `draw` stop and sounds pause until `Game::resumed`.
+- **Sound** pauses when the OS pauses the app, also behind a dialog on Android where `Game::suspended` doesn't fire,
+  and the audio stream closes meanwhile to save battery. If the output goes away, such as an unplugged headset, the
+  stream is reopened and sounds carry on. On iOS, sound mixes with the player's music and obeys the silent switch
+  (`AudioSession::Ambient`). Use `ctx.audio.set_session` in `load` to change that. Interruptions like phone calls pause
+  it until they end. Android has no such setting: games play alongside other apps there.
 - **`ctx.quit()` ends the app**, even on iOS, where apps normally don't quit themselves. Apple's review guidelines
   discourage offering this, so don't show a quit button in an iOS game.
 - **Logs:** on Android, `log` output goes to logcat under the `love2drs` tag, and `cargo love2drs android run` follows it.
   On iOS, nothing collects `log` output unless you install a logger, but panics and startup errors reach stderr,
   which `cargo love2drs ios run` shows.
 
-**Not supported yet:** store packaging. Google Play needs an `.aab`, which the tool doesn't make, and App Store
-uploads need an `.ipa` from Xcode.
+**Store packaging.** `package` always builds optimized.
+
+- **Google Play:** `cargo love2drs android package --keystore upload.jks --key-alias upload --bundletool bundletool-all.jar`
+  writes `target/love2drs/android/<name>-release.aab`, with the keystore's password read from `LOVE2DRS_KEYSTORE_PASS`
+  (and the key's from `LOVE2DRS_KEY_PASS`, if different). It needs a JDK and
+  [bundletool](https://github.com/google/bundletool/releases), which `BUNDLETOOL_JAR` can also point to. The bundle
+  requests 16 KB alignment for native libraries and includes their debug symbols.
+- **App Store:** on a Mac, `cargo love2drs ios package --identity <NAME> --profile <PATH>` writes `<name>.ipa` and
+  `<name>.app.dSYM` to `target/love2drs/ios/iphoneos/release/`. It adds the `DT*` keys App Store Connect checks and a
+  privacy manifest. The manifest it makes declares no tracking or data collection, and the required-reason system APIs
+  found in the executable. If that isn't true of your game, write your own and set `privacy_manifest`.
+- **32-bit Android (`armeabi-v7a`)** isn't built, as Google Play only requires 64-bit. Phones that can only run 32-bit
+  apps can't install the game.
 
 ## Cargo features
 

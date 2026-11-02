@@ -51,7 +51,9 @@
 //! the `cargo-love2drs` tool. On a phone the window always fills the screen, so
 //! lay out from `ctx.graphics.width()` and `height()`, keep touch targets inside
 //! [`ctx.window.safe_area()`](window::Window::safe_area), load files through
-//! [`filesystem`], and save progress in [`Game::suspended`].
+//! [`filesystem`], and save progress in [`Game::suspended`]. If the game acts
+//! when a finger lifts, forget the press in [`Game::touch_cancelled`], which is
+//! what happens when the OS takes a touch away.
 //!
 //! ## Performance
 //!
@@ -98,7 +100,7 @@ pub use winit;
 /// [`math::sin_cos`] and [`math::set_random_seed`].
 pub mod prelude {
     #[cfg(feature = "audio")]
-    pub use crate::audio::{Audio, SoundData, Source};
+    pub use crate::audio::{Audio, AudioSession, SoundData, Source};
     pub use crate::graphics::DrawMode::{self, Fill, Line};
     pub use crate::graphics::{
         Align, BlendMode, Canvas, Color, DrawParams, Drawable, FilterMode, Font, Graphics, Image,

@@ -50,15 +50,57 @@ impl MouseButton {
 
 const BUTTONS: usize = 16;
 
+/// Which buttons are held and what changed since the previous frame.
+#[derive(Default)]
+struct Buttons {
+    down: [bool; BUTTONS],
+    pressed: [bool; BUTTONS],
+    released: [bool; BUTTONS],
+    cancelled: [bool; BUTTONS],
+}
+
+impl Buttons {
+    fn press(&mut self, i: usize) {
+        if !self.down[i] {
+            self.pressed[i] = true;
+        }
+        self.down[i] = true;
+    }
+
+    fn release(&mut self, i: usize) {
+        if self.down[i] {
+            self.released[i] = true;
+        }
+        self.down[i] = false;
+    }
+
+    fn cancel(&mut self, i: usize) {
+        if self.down[i] {
+            self.cancelled[i] = true;
+        }
+        self.down[i] = false;
+    }
+
+    fn release_all(&mut self) {
+        for i in 0..BUTTONS {
+            self.release(i);
+        }
+    }
+
+    fn end_frame(&mut self) {
+        self.pressed = [false; BUTTONS];
+        self.released = [false; BUTTONS];
+        self.cancelled = [false; BUTTONS];
+    }
+}
+
 /// Mouse state, updated before each `update`. Reach it through `ctx.mouse`.
 pub struct Mouse {
     window: Arc<Window>,
     pub(crate) position: Vec2,
     delta: Vec2,
     wheel: Vec2,
-    down: [bool; BUTTONS],
-    pressed: [bool; BUTTONS],
-    released: [bool; BUTTONS],
+    buttons: Buttons,
     visible: bool,
     grabbed: bool,
     pub(crate) inside: bool,
@@ -71,9 +113,7 @@ impl Mouse {
             position: Vec2::ZERO,
             delta: Vec2::ZERO,
             wheel: Vec2::ZERO,
-            down: [false; BUTTONS],
-            pressed: [false; BUTTONS],
-            released: [false; BUTTONS],
+            buttons: Buttons::default(),
             visible: true,
             grabbed: false,
             inside: false,
@@ -107,17 +147,24 @@ impl Mouse {
 
     /// Whether `button` is currently held down.
     pub fn is_down(&self, button: MouseButton) -> bool {
-        self.down[button.index()]
+        self.buttons.down[button.index()]
     }
 
     /// Whether `button` went down since the previous frame.
     pub fn was_pressed(&self, button: MouseButton) -> bool {
-        self.pressed[button.index()]
+        self.buttons.pressed[button.index()]
     }
 
     /// Whether `button` was let go since the previous frame.
     pub fn was_released(&self, button: MouseButton) -> bool {
-        self.released[button.index()]
+        self.buttons.released[button.index()]
+    }
+
+    /// Whether `button` stopped being held since the previous frame without being
+    /// let go. This only happens on mobile, when the OS takes the finger that acts
+    /// as the mouse, and doesn't count as [`was_released`](Mouse::was_released).
+    pub fn was_cancelled(&self, button: MouseButton) -> bool {
+        self.buttons.cancelled[button.index()]
     }
 
     /// Whether the cursor is over the window.
@@ -175,34 +222,55 @@ impl Mouse {
     }
 
     pub(crate) fn press(&mut self, b: MouseButton) {
-        let i = b.index();
-        if !self.down[i] {
-            self.pressed[i] = true;
-        }
-        self.down[i] = true;
+        self.buttons.press(b.index());
     }
 
     pub(crate) fn release(&mut self, b: MouseButton) {
-        let i = b.index();
-        if self.down[i] {
-            self.released[i] = true;
-        }
-        self.down[i] = false;
+        self.buttons.release(b.index());
+    }
+
+    pub(crate) fn cancel(&mut self, b: MouseButton) {
+        self.buttons.cancel(b.index());
     }
 
     pub(crate) fn release_all(&mut self) {
-        for i in 0..BUTTONS {
-            if self.down[i] {
-                self.released[i] = true;
-                self.down[i] = false;
-            }
-        }
+        self.buttons.release_all();
     }
 
     pub(crate) fn end_frame(&mut self) {
         self.delta = Vec2::ZERO;
         self.wheel = Vec2::ZERO;
-        self.pressed = [false; BUTTONS];
-        self.released = [false; BUTTONS];
+        self.buttons.end_frame();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_button_is_not_released() {
+        let mut b = Buttons::default();
+        b.press(0);
+        b.end_frame();
+        b.cancel(0);
+        assert!(!b.down[0]);
+        assert!(b.cancelled[0]);
+        assert!(!b.released[0]);
+
+        b.end_frame();
+        assert!(!b.cancelled[0]);
+        b.cancel(0);
+        assert!(!b.cancelled[0], "wasn't down");
+    }
+
+    #[test]
+    fn release_all_only_releases_what_is_down() {
+        let mut b = Buttons::default();
+        b.press(1);
+        b.release_all();
+        assert!(b.released[1]);
+        assert!(!b.released[0]);
+        assert!(!b.down[1]);
     }
 }
