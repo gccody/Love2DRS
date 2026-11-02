@@ -231,7 +231,12 @@ When a game should run on phones:
 - Load files with love2drs loaders or `love2drs::filesystem::read`. `std::fs::read` can't see packaged assets.
 - Save in `Game::suspended`. The OS may end a backgrounded app without another callback.
 - Android's back gesture is `Key::Escape`, and the first finger also acts as the left mouse button.
-- Gamepads, rumble and the on-screen keyboard don't work on mobile yet.
+- `ctx.gamepad` and rumble work as on desktop. Check `is_vibration_supported()` before relying on rumble.
+- `ctx.keyboard.set_screen_keyboard(true)` opens the on-screen keyboard. Read typing from `text_input`, and
+  `Key::Backspace` and `Key::Enter` from `key_pressed`. `safe_area()` shrinks while it's up, and the user can
+  close it without the game finding out. Android only delivers text that maps to key presses, so emoji, other
+  scripts and autocorrect may not arrive.
+- Set `icon = "path/to/square.png"` under `[package.metadata.love2drs]` for the app icon.
 
 ## Verifying your work
 

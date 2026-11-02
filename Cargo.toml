@@ -24,7 +24,7 @@ audio = ["dep:rodio"]
 ## Gamepad input via gilrs. On Linux, building it needs the libudev headers
 ## (`libudev-dev` on Debian/Ubuntu, `systemd-devel` on Fedora). On Windows and
 ## macOS it also pulls in hidapi to drive PlayStation controllers directly.
-gamepad = ["dep:gilrs", "dep:hidapi"]
+gamepad = ["dep:gilrs", "dep:hidapi", "dep:objc2-game-controller", "dep:objc2-core-haptics"]
 ## PNG decoding for `Graphics::new_image`.
 png = ["image/png"]
 ## JPEG decoding for `Graphics::new_image`.
@@ -55,6 +55,14 @@ winit = { version = "0.30", features = ["android-native-activity"] }
 android_logger = "0.15"
 jni = "0.21"
 
+# Apple's frameworks on iOS: UIKit for the keyboard's size, GameController and
+# CoreHaptics for controllers, which gilrs doesn't support there.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-game-controller = { version = "0.3", optional = true, features = ["objc2-core-haptics"] }
+objc2-core-haptics = { version = "0.3", optional = true }
+
 # Dependencies (wgpu, image decoding, audio) are compiled with optimizations even in
 # debug builds of the examples so they stay smooth while iterating.
 [profile.dev.package."*"]
@@ -68,6 +76,7 @@ opt-level = 1
 [package.metadata.love2drs]
 app_id = "com.gccody.love2drs"
 assets = ["assets/mobile"]
+icon = "assets/app-icon.png"
 
 [[example]]
 name = "starfall"

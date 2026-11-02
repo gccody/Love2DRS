@@ -7,7 +7,9 @@
 //! no gamepad backend, [`Gamepads`] simply reports no controllers.
 //!
 //! On Windows and macOS, PlayStation controllers are read straight over HID
-//! instead (see `sony.rs`), since gilrs can't rumble them there.
+//! instead (see `sony.rs`), since gilrs can't rumble them there. gilrs doesn't
+//! support Android and iOS, which have their own backends (`android.rs` and
+//! `ios_pad.rs`).
 
 #[cfg(feature = "gamepad")]
 use std::time::{Duration, Instant};
@@ -15,6 +17,14 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "gamepad")]
 use super::sony;
 use crate::math::{Vec2, vec2};
+
+/// How often to look for controllers that came or went on Android, which only
+/// tells Java code about them.
+#[cfg(all(feature = "gamepad", target_os = "android"))]
+const ANDROID_RESCAN: Duration = Duration::from_secs(1);
+/// How far a trigger or d-pad axis has to move to count as pressing its button.
+#[cfg(all(feature = "gamepad", target_os = "android"))]
+const AXIS_BUTTON_THRESHOLD: f32 = 0.5;
 
 /// How long a PlayStation pad that gilrs reports may take to show up over HID
 /// before it's shown through gilrs instead (e.g. another app holds it open).
@@ -218,6 +228,16 @@ enum Source {
     },
     /// A PlayStation controller driven directly (Windows and macOS).
     Hid(sony::Pad),
+    #[cfg(target_os = "android")]
+    Android {
+        device: i32,
+        /// The triggers report axes, not just buttons.
+        analog_triggers: bool,
+        /// The d-pad reports axes, not just buttons.
+        hat: bool,
+    },
+    #[cfg(target_os = "ios")]
+    Ios(super::ios_pad::Pad),
     /// Hand-built pads in unit tests.
     #[cfg(test)]
     Test,
@@ -297,7 +317,8 @@ impl Gamepad {
     /// Xbox-style controllers rumble on Windows and Linux. PlayStation
     /// controllers (DualShock 4, DualSense, DualSense Edge) rumble on Windows,
     /// macOS and Linux, over USB or Bluetooth. Other controllers on macOS
-    /// report `false`.
+    /// report `false`. On Android and iOS it depends on the controller and the
+    /// OS version.
     pub fn is_vibration_supported(&self) -> bool {
         self.vibration_supported
     }
@@ -394,6 +415,8 @@ pub struct Gamepads {
     hidden: Vec<Hidden>,
     #[cfg(feature = "gamepad")]
     next_scan: Option<Instant>,
+    #[cfg(all(feature = "gamepad", target_os = "android"))]
+    next_android_scan: Option<Instant>,
 }
 
 impl Gamepads {
@@ -402,7 +425,12 @@ impl Gamepads {
         let mut pads = Gamepads {
             pads: Vec::new(),
             events: Vec::new(),
-            #[cfg(feature = "gamepad")]
+            #[cfg(all(feature = "gamepad", any(target_os = "android", target_os = "ios")))]
+            gilrs: None,
+            #[cfg(all(
+                feature = "gamepad",
+                not(any(target_os = "android", target_os = "ios"))
+            ))]
             gilrs: match gilrs::Gilrs::new() {
                 Ok(g) => Some(g),
                 Err(gilrs::Error::NotImplemented(g)) => {
@@ -420,6 +448,8 @@ impl Gamepads {
             hidden: Vec::new(),
             #[cfg(feature = "gamepad")]
             next_scan: None,
+            #[cfg(all(feature = "gamepad", target_os = "android"))]
+            next_android_scan: None,
         };
         // Controllers that were plugged in before the game started are
         // announced as `gamepad_added` on the first frame, like LÖVE does.
@@ -542,6 +572,12 @@ impl Gamepads {
             }
             let (gilrs_id, slot) = match &mut pad.source {
                 Source::Hid(hid) => return hid.set(left, right, duration),
+                #[cfg(target_os = "android")]
+                Source::Android { device, .. } => {
+                    return super::android::pads::vibrate(*device, left, right, duration);
+                }
+                #[cfg(target_os = "ios")]
+                Source::Ios(ios) => return ios.set(left, right, duration),
                 Source::Gilrs { id, effect } => (*id, effect),
                 #[cfg(test)]
                 Source::Test => return false,
@@ -614,7 +650,252 @@ impl Gamepads {
             self.poll_gilrs();
             self.poll_hid();
             self.reconcile_hid(Instant::now());
+            #[cfg(target_os = "android")]
+            self.scan_android(Instant::now());
+            #[cfg(target_os = "ios")]
+            self.poll_ios();
         }
+    }
+
+    /// The OS stops telling a backgrounded app about controllers, so anything
+    /// held now would stay down. Rumble stops too, as nobody is playing.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(crate) fn suspend(&mut self) {
+        #[cfg(feature = "gamepad")]
+        for id in self.ids().collect::<Vec<_>>() {
+            self.stop_vibration(id);
+            let idle = sony::Input {
+                down: [false; BUTTONS],
+                axes: [0.0; AXES],
+            };
+            if let Some(pad) = self.pads.iter_mut().find(|p| p.id == id) {
+                pad.apply(&idle, &mut self.events);
+            }
+        }
+    }
+
+    /// Follows what's in `GCController.controllers`.
+    #[cfg(all(feature = "gamepad", target_os = "ios"))]
+    fn poll_ios(&mut self) {
+        use super::ios_pad;
+
+        let controllers = ios_pad::controllers();
+        let is_connected = |pad: &Gamepad| match &pad.source {
+            Source::Ios(ios) => controllers.iter().any(|c| ios.is(c)),
+            _ => true,
+        };
+        let gone: Vec<GamepadId> = self
+            .pads
+            .iter()
+            .filter(|p| !is_connected(p))
+            .map(|p| p.id)
+            .collect();
+        for id in gone {
+            self.pads.retain(|p| p.id != id);
+            self.events.push(GamepadEvent::Removed(id));
+        }
+        for controller in controllers {
+            let known = self
+                .pads
+                .iter()
+                .any(|p| matches!(&p.source, Source::Ios(ios) if ios.is(&controller)));
+            if !known {
+                let ios = ios_pad::Pad::new(controller);
+                self.add_pad(ios.name(), ios.can_rumble(), Source::Ios(ios));
+            }
+        }
+        let now = Instant::now();
+        for pad in &mut self.pads {
+            if let Source::Ios(ios) = &mut pad.source {
+                ios.update(now);
+                let input = ios.input();
+                pad.apply(&input, &mut self.events);
+            }
+        }
+    }
+
+    /// Adds controllers Android knows about and removes those it no longer does.
+    #[cfg(all(feature = "gamepad", target_os = "android"))]
+    fn scan_android(&mut self, now: Instant) {
+        if self.next_android_scan.is_some_and(|t| now < t) {
+            return;
+        }
+        self.next_android_scan = Some(now + ANDROID_RESCAN);
+        let devices = super::android::pads::devices();
+        let gone: Vec<GamepadId> = self
+            .pads
+            .iter()
+            .filter(|p| match p.source {
+                Source::Android { device, .. } => !devices.iter().any(|d| d.id == device),
+                _ => false,
+            })
+            .map(|p| p.id)
+            .collect();
+        for id in gone {
+            self.pads.retain(|p| p.id != id);
+            self.events.push(GamepadEvent::Removed(id));
+        }
+        for device in devices {
+            self.add_android_pad(device);
+        }
+    }
+
+    #[cfg(all(feature = "gamepad", target_os = "android"))]
+    fn add_android_pad(&mut self, device: super::android::pads::Device) {
+        if self.android_pad(device.id).is_none() {
+            self.add_pad(
+                device.name,
+                device.can_rumble,
+                Source::Android {
+                    device: device.id,
+                    analog_triggers: false,
+                    hat: false,
+                },
+            );
+        }
+    }
+
+    #[cfg(all(feature = "gamepad", target_os = "android"))]
+    fn android_pad(&self, device: i32) -> Option<GamepadId> {
+        self.pads
+            .iter()
+            .find(|p| matches!(p.source, Source::Android { device: d, .. } if d == device))
+            .map(|p| p.id)
+    }
+
+    /// The pad an event came from. Input can arrive before the next scan finds it.
+    #[cfg(all(feature = "gamepad", target_os = "android"))]
+    fn android_pad_or_add(&mut self, device: i32) -> Option<GamepadId> {
+        if self.android_pad(device).is_none() {
+            self.add_android_pad(super::android::pads::device(device)?);
+        }
+        self.android_pad(device)
+    }
+
+    /// A controller button changed on Android.
+    #[cfg(target_os = "android")]
+    pub(crate) fn android_button(&mut self, device: i32, button: GamepadButton, down: bool) {
+        #[cfg(feature = "gamepad")]
+        {
+            let Some(id) = self.android_pad_or_add(device) else {
+                return;
+            };
+            let (analog_triggers, hat) = match self.pad_mut(id).map(|p| &p.source) {
+                Some(Source::Android {
+                    analog_triggers,
+                    hat,
+                    ..
+                }) => (*analog_triggers, *hat),
+                _ => return,
+            };
+            // A pad with analog input presses these buttons in `android_motion`.
+            let axis = match button {
+                GamepadButton::LeftTrigger => Some(GamepadAxis::LeftTrigger),
+                GamepadButton::RightTrigger => Some(GamepadAxis::RightTrigger),
+                _ => None,
+            };
+            if axis.is_some() && analog_triggers {
+                return;
+            }
+            let is_dpad = matches!(
+                button,
+                GamepadButton::DPadUp
+                    | GamepadButton::DPadDown
+                    | GamepadButton::DPadLeft
+                    | GamepadButton::DPadRight
+            );
+            if is_dpad && hat {
+                return;
+            }
+            self.set_button(id, button, down);
+            if let Some(axis) = axis {
+                self.set_axis(id, axis, if down { 1.0 } else { 0.0 });
+            }
+        }
+        #[cfg(not(feature = "gamepad"))]
+        let _ = (device, button, down);
+    }
+
+    /// A controller's sticks, triggers or d-pad axes moved on Android.
+    #[cfg(target_os = "android")]
+    pub(crate) fn android_motion(&mut self, motion: &super::android::PadMotion) {
+        #[cfg(feature = "gamepad")]
+        {
+            use GamepadAxis as A;
+            use GamepadButton as B;
+
+            let Some(id) = self.android_pad_or_add(motion.device) else {
+                return;
+            };
+            let (x, y) = sony::dead_zone(motion.left.0, motion.left.1);
+            self.set_axis(id, A::LeftX, x);
+            self.set_axis(id, A::LeftY, y);
+            let (x, y) = sony::dead_zone(motion.right.0, motion.right.1);
+            self.set_axis(id, A::RightX, x);
+            self.set_axis(id, A::RightY, y);
+
+            let (left, right) = (motion.left_trigger, motion.right_trigger);
+            let (hat_x, hat_y) = motion.hat;
+            let mut analog_triggers = left != 0.0 || right != 0.0;
+            let mut hat = hat_x != 0.0 || hat_y != 0.0;
+            if let Some(Source::Android {
+                analog_triggers: seen_triggers,
+                hat: seen_hat,
+                ..
+            }) = self.pad_mut(id).map(|p| &mut p.source)
+            {
+                analog_triggers |= *seen_triggers;
+                hat |= *seen_hat;
+                *seen_triggers = analog_triggers;
+                *seen_hat = hat;
+            }
+            if analog_triggers {
+                self.set_axis(id, A::LeftTrigger, left.clamp(0.0, 1.0));
+                self.set_axis(id, A::RightTrigger, right.clamp(0.0, 1.0));
+                self.set_button(id, B::LeftTrigger, left > AXIS_BUTTON_THRESHOLD);
+                self.set_button(id, B::RightTrigger, right > AXIS_BUTTON_THRESHOLD);
+            }
+            if hat {
+                self.set_button(id, B::DPadLeft, hat_x < -AXIS_BUTTON_THRESHOLD);
+                self.set_button(id, B::DPadRight, hat_x > AXIS_BUTTON_THRESHOLD);
+                self.set_button(id, B::DPadUp, hat_y < -AXIS_BUTTON_THRESHOLD);
+                self.set_button(id, B::DPadDown, hat_y > AXIS_BUTTON_THRESHOLD);
+            }
+        }
+        #[cfg(not(feature = "gamepad"))]
+        let _ = motion;
+    }
+
+    #[cfg(all(feature = "gamepad", target_os = "android"))]
+    fn set_button(&mut self, id: GamepadId, button: GamepadButton, down: bool) {
+        let Some(pad) = self.pad_mut(id) else { return };
+        if pad.is_down(button) == down {
+            return;
+        }
+        if down {
+            pad.press(button);
+            self.events.push(GamepadEvent::Pressed(id, button));
+        } else {
+            pad.release(button);
+            self.events.push(GamepadEvent::Released(id, button));
+        }
+    }
+
+    /// Lists a new controller and announces it.
+    #[cfg(feature = "gamepad")]
+    fn add_pad(&mut self, name: String, vibration_supported: bool, source: Source) {
+        let id = self.free_id();
+        self.pads.push(Gamepad {
+            id,
+            name,
+            down: [false; BUTTONS],
+            pressed: [false; BUTTONS],
+            released: [false; BUTTONS],
+            axes: [0.0; AXES],
+            vibration_supported,
+            source,
+        });
+        self.events.push(GamepadEvent::Added(id));
     }
 
     #[cfg(feature = "gamepad")]
@@ -768,18 +1049,7 @@ impl Gamepads {
             self.sony.scan(&open)
         };
         for hid in found {
-            let id = self.free_id();
-            self.pads.push(Gamepad {
-                id,
-                name: hid.name().to_owned(),
-                down: [false; BUTTONS],
-                pressed: [false; BUTTONS],
-                released: [false; BUTTONS],
-                axes: [0.0; AXES],
-                vibration_supported: true,
-                source: Source::Hid(hid),
-            });
-            self.events.push(GamepadEvent::Added(id));
+            self.add_pad(hid.name().to_owned(), true, Source::Hid(hid));
         }
     }
 
@@ -820,21 +1090,14 @@ impl Gamepads {
             return;
         };
         let (name, ff) = (gp.name().to_owned(), gp.is_ff_supported());
-        let id = self.free_id();
-        self.pads.push(Gamepad {
-            id,
+        self.add_pad(
             name,
-            down: [false; BUTTONS],
-            pressed: [false; BUTTONS],
-            released: [false; BUTTONS],
-            axes: [0.0; AXES],
-            vibration_supported: ff,
-            source: Source::Gilrs {
+            ff,
+            Source::Gilrs {
                 id: gilrs_id,
                 effect: None,
             },
-        });
-        self.events.push(GamepadEvent::Added(id));
+        );
     }
 
     /// The lowest id no connected pad uses, so a replugged pad usually gets
@@ -897,6 +1160,8 @@ mod tests {
             hidden: Vec::new(),
             #[cfg(feature = "gamepad")]
             next_scan: None,
+            #[cfg(all(feature = "gamepad", target_os = "android"))]
+            next_android_scan: None,
         }
     }
 

@@ -42,8 +42,8 @@ impl Window {
         (s.width, s.height)
     }
 
-    /// The part of the window that notches, rounded corners and system bars
-    /// don't cover, as `(x, y, width, height)` in logical pixels
+    /// The part of the window that notches, rounded corners, system bars and the
+    /// on-screen keyboard don't cover, as `(x, y, width, height)` in logical pixels
     /// (`love.window.getSafeArea`). On desktop, and on Android before version 11,
     /// this is the whole window. It changes when the device rotates.
     pub fn safe_area(&self) -> (f32, f32, f32, f32) {
@@ -52,7 +52,11 @@ impl Window {
         if let Ok(pos) = self.inner.inner_position() {
             let pos = pos.to_logical::<f32>(scale);
             let size = self.inner.inner_size().to_logical::<f32>(scale);
-            return (pos.x, pos.y, size.width, size.height);
+            let height = match self.ios_keyboard_top() {
+                Some(top) => size.height.min(top - pos.y),
+                None => size.height,
+            };
+            return (pos.x, pos.y, size.width, height);
         }
         #[cfg(target_os = "android")]
         if let Some((left, top, right, bottom)) = crate::platform::window_insets() {
@@ -65,6 +69,33 @@ impl Window {
         let _ = scale;
         let (w, h) = self.size();
         (0.0, 0.0, w, h)
+    }
+
+    /// The top of the on-screen keyboard's area, in logical pixels from the top of
+    /// the window. Without a keyboard it's the bottom of the safe area.
+    #[cfg(target_os = "ios")]
+    fn ios_keyboard_top(&self) -> Option<f32> {
+        use objc2::runtime::AnyObject;
+        use objc2::{msg_send, sel};
+        use objc2_foundation::NSRect;
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = self.inner.window_handle().ok()?;
+        let RawWindowHandle::UiKit(handle) = handle.as_raw() else {
+            return None;
+        };
+        // SAFETY: the handle's view lives as long as the window, and the guide is
+        // only used where UIKit has it (iOS 15 and up).
+        unsafe {
+            let view: &AnyObject = handle.ui_view.cast::<AnyObject>().as_ref();
+            let has_guide: bool = msg_send![view, respondsToSelector: sel!(keyboardLayoutGuide)];
+            if !has_guide {
+                return None;
+            }
+            let guide: *mut AnyObject = msg_send![view, keyboardLayoutGuide];
+            let frame: NSRect = msg_send![guide, layoutFrame];
+            Some(frame.origin.y as f32)
+        }
     }
 
     /// Requests a new inner size in logical pixels.

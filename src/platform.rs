@@ -46,6 +46,8 @@ macro_rules! android_main {
 pub use android::{__android_entry, MainResult};
 #[cfg(target_os = "android")]
 pub(crate) use android::{android_app, window_insets};
+#[cfg(all(target_os = "android", feature = "gamepad"))]
+pub(crate) use android::{sdk_version, with_jni};
 
 #[cfg(target_os = "android")]
 mod android {
@@ -68,32 +70,47 @@ mod android {
         APP.get().expect("love2drs::android_main! sets the app")
     }
 
-    /// How far the system bars and display cutouts reach into the window on each
-    /// side, as `(left, top, right, bottom)` in physical pixels. `None` before
-    /// Android 11, which lacks this API, or while the window isn't attached.
-    pub(crate) fn window_insets() -> Option<(i32, i32, i32, i32)> {
+    /// Calls Android's Java APIs, which have no native equivalent. A Java exception
+    /// or JNI failure gives `None`. The closure also gets the activity.
+    pub(crate) fn with_jni<T>(
+        f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>,
+    ) -> Option<T> {
         let app = android_app();
         // SAFETY: android-activity keeps both pointers valid while the activity
         // lives, and the game only runs during that time.
         let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
         let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
-        let mut env = vm.attach_current_thread().ok()?;
-        let insets = env.with_local_frame(16, |env| query_insets(env, &activity));
+        // Stays attached, because `safe_area` can get here several times per frame.
+        let mut env = vm.attach_current_thread_permanently().ok()?;
+        let result = env.with_local_frame(32, |env| f(env, &activity));
         if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
             let _ = env.exception_clear();
         }
-        insets.ok().flatten()
+        result.ok()
     }
 
-    /// `activity.getWindow().getDecorView().getRootWindowInsets()
-    ///     .getInsets(Type.systemBars() | Type.displayCutout())`
+    pub(crate) fn sdk_version(env: &mut JNIEnv) -> jni::errors::Result<i32> {
+        env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?
+            .i()
+    }
+
+    /// How far the system bars, display cutouts and on-screen keyboard reach into
+    /// the window on each side, as `(left, top, right, bottom)` in physical pixels.
+    /// `None` before Android 11, which lacks this API, or while the window isn't
+    /// attached.
+    pub(crate) fn window_insets() -> Option<(i32, i32, i32, i32)> {
+        with_jni(query_insets).flatten()
+    }
+
+    /// `activity.getWindow().getDecorView().getRootWindowInsets().getInsets(
+    ///     Type.systemBars() | Type.displayCutout() | Type.ime())`
     fn query_insets(
         env: &mut JNIEnv,
         activity: &JObject,
     ) -> jni::errors::Result<Option<(i32, i32, i32, i32)>> {
         const ANDROID_11: i32 = 30;
-        let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?;
-        if sdk.i()? < ANDROID_11 {
+        if sdk_version(env)? < ANDROID_11 {
             return Ok(None);
         }
         let window = env
@@ -117,7 +134,9 @@ mod android {
             env.call_static_method("android/view/WindowInsets$Type", name, "()I", &[])?
                 .i()
         };
-        let mask = inset_type(env, "systemBars")? | inset_type(env, "displayCutout")?;
+        let mask = inset_type(env, "systemBars")?
+            | inset_type(env, "displayCutout")?
+            | inset_type(env, "ime")?;
         let insets = env
             .call_method(
                 &root,

@@ -590,7 +590,9 @@ fn main() -> love2drs::Result {
 
 ## 10. Text input field
 
-Use `text_input` for characters (layout/IME aware) and `key_pressed` for editing keys.
+Use `text_input` for characters (layout/IME aware) and `key_pressed` for editing keys. On phones, also call
+`ctx.keyboard.set_screen_keyboard(true)` when the field is tapped, `set_screen_keyboard(false)` when it's
+done, and keep the field inside `ctx.window.safe_area()`, which leaves out the keyboard.
 
 ```rust
 use love2drs::prelude::*;
@@ -729,6 +731,7 @@ app_id = "com.example.mygame"
 name = "My Game"
 assets = ["assets"]        # packaged at the same path, so new_image("assets/x.png") still works
 orientation = "landscape"  # landscape, portrait or any
+icon = "assets/icon.png"   # square PNG, 1024x1024 is best
 ```
 
 ```rust

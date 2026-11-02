@@ -227,7 +227,8 @@ fn build_apk(
     }
 
     let manifest = work.join("AndroidManifest.xml");
-    let manifest_text = android_manifest(project, &lib_name, !options.release);
+    let manifest_text =
+        android_manifest(project, &lib_name, !options.release, project.icon.is_some());
     std::fs::write(&manifest, manifest_text).map_err(|e| format!("{}: {e}", manifest.display()))?;
 
     let base = work.join("base.apk");
@@ -246,6 +247,9 @@ fn build_apk(
         .args(["--version-name", &project.version]);
     if !options.release {
         aapt2.arg("--debug-mode");
+    }
+    if let Some(icon) = &project.icon {
+        aapt2.arg(compile_icon(sdk, &project.root.join(icon), &work)?);
     }
     run(&mut aapt2, "")?;
 
@@ -375,16 +379,16 @@ fn retarget_game_crate(args: &mut [String], game: &str) -> Option<(PathBuf, Path
     ))
 }
 
-fn android_manifest(project: &Project, lib_name: &str, debuggable: bool) -> String {
+fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_icon: bool) -> String {
     let orientation = match project.orientation {
         // The `user` variants respect the rotation lock.
         Orientation::Any => "fullUser",
         Orientation::Landscape => "userLandscape",
         Orientation::Portrait => "userPortrait",
     };
-    let permissions: String = project
-        .permissions
-        .iter()
+    // Controller rumble needs this. Android grants it without asking the user.
+    let permissions: String = std::iter::once("android.permission.VIBRATE")
+        .chain(project.permissions.iter().map(String::as_str))
         .map(|p| {
             format!(
                 "    <uses-permission android:name=\"{}\" />\n",
@@ -394,6 +398,11 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool) -> Stri
         .collect();
     let package = xml_escape(&project.android_id());
     let label = xml_escape(&project.display_name);
+    let icon = if has_icon {
+        "\n        android:icon=\"@mipmap/ic_launcher\""
+    } else {
+        ""
+    };
     // `configChanges`: the game handles rotation itself through `resize`. Android
     // would otherwise destroy the activity, and its game state with it.
     //
@@ -404,7 +413,7 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool) -> Stri
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package}">
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 {permissions}    <application
-        android:label="{label}"
+        android:label="{label}"{icon}
         android:hasCode="false"
         android:debuggable="{debuggable}"
         android:extractNativeLibs="false"
@@ -426,6 +435,71 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool) -> Stri
 </manifest>
 "#
     )
+}
+
+/// Writes the launcher icon at every density as Android resources and compiles
+/// them. Returns the file `aapt2 link` takes.
+fn compile_icon(sdk: &Sdk, icon: &Path, work: &Path) -> Result<PathBuf, String> {
+    let res = work.join("res");
+    if res.exists() {
+        std::fs::remove_dir_all(&res).map_err(|e| format!("{}: {e}", res.display()))?;
+    }
+    let source = crate::icon::load(icon)?;
+    let write = |dir: &str, name: &str, image: &image::RgbaImage| {
+        let dir = res.join(dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        image
+            .save(dir.join(name))
+            .map_err(|e| format!("can't write the icon: {e}"))
+    };
+    // The launcher icon for each screen density, used before Android 8.
+    for (density, size) in [
+        ("mdpi", 48),
+        ("hdpi", 72),
+        ("xhdpi", 96),
+        ("xxhdpi", 144),
+        ("xxxhdpi", 192),
+    ] {
+        let image = crate::icon::resized(&source, size);
+        write(&format!("mipmap-{density}"), "ic_launcher.png", &image)?;
+    }
+    // Since Android 8, launchers cut icons into shapes of their own from two 108 dp
+    // layers, of which only the middle 72 dp is sure to show. Fitting the icon
+    // there and filling the rest with its corner color keeps all of it visible.
+    let foreground = crate::icon::centered(&source, 432, 288);
+    write("mipmap-xxxhdpi", "ic_launcher_foreground.png", &foreground)?;
+    let values = res.join("values");
+    std::fs::create_dir_all(&values).map_err(|e| format!("{}: {e}", values.display()))?;
+    let [r, g, b, _] = crate::icon::corner_color(&source);
+    std::fs::write(
+        values.join("colors.xml"),
+        format!(
+            "<resources><color name=\"ic_launcher_background\">#{r:02x}{g:02x}{b:02x}</color></resources>\n"
+        ),
+    )
+    .map_err(|e| format!("can't write the icon: {e}"))?;
+    let adaptive = res.join("mipmap-anydpi-v26");
+    std::fs::create_dir_all(&adaptive).map_err(|e| format!("{}: {e}", adaptive.display()))?;
+    std::fs::write(
+        adaptive.join("ic_launcher.xml"),
+        "<adaptive-icon xmlns:android=\"http://schemas.android.com/apk/res/android\">\n\
+         <background android:drawable=\"@color/ic_launcher_background\" />\n\
+         <foreground android:drawable=\"@mipmap/ic_launcher_foreground\" />\n\
+         </adaptive-icon>\n",
+    )
+    .map_err(|e| format!("can't write the icon: {e}"))?;
+
+    let compiled = work.join("res.zip");
+    run(
+        Command::new(sdk.tool("aapt2"))
+            .arg("compile")
+            .arg("--dir")
+            .arg(&res)
+            .arg("-o")
+            .arg(&compiled),
+        "",
+    )?;
+    Ok(compiled)
 }
 
 /// Copies the APK from `aapt2` and adds native libraries and assets to it.
@@ -645,13 +719,16 @@ mod tests {
             min_sdk: 26,
             target_sdk: 36,
             permissions: vec!["android.permission.INTERNET".into()],
+            icon: None,
             ios_deployment_target: "15.0".into(),
         }
     }
 
     #[test]
     fn manifest_fills_in_the_project() {
-        let xml = android_manifest(&project(), "my_game", true);
+        let xml = android_manifest(&project(), "my_game", true, true);
+        assert!(xml.contains(r#"android:icon="@mipmap/ic_launcher""#));
+        assert!(xml.contains("android.permission.VIBRATE"));
         assert!(xml.contains(r#"package="com.example.my_game""#));
         assert!(xml.contains(r#"android:label="Tom &amp; Jerry""#));
         assert!(xml.contains(r#"android:debuggable="true""#));

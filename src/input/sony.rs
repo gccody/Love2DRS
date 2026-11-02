@@ -163,7 +163,7 @@ fn decode(sticks: [u8; 4], l2: u8, r2: u8, b: [u8; 3]) -> Input {
 }
 
 /// Radial dead zone, rescaled so values still reach 1 (as gilrs does).
-fn dead_zone(x: f32, y: f32) -> (f32, f32) {
+pub(crate) fn dead_zone(x: f32, y: f32) -> (f32, f32) {
     let magnitude = (x * x + y * y).sqrt().min(1.0);
     if magnitude <= STICK_DEAD_ZONE {
         (0.0, 0.0)

@@ -187,6 +187,8 @@ where
         last_frame: Instant::now(),
         suspended: false,
         mouse_finger: None,
+        #[cfg(target_os = "android")]
+        android_input: Default::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -204,6 +206,32 @@ fn exit_app(event_loop: &ActiveEventLoop) {
         std::process::exit(0);
     }
     event_loop.exit();
+}
+
+/// Updates the keyboard state and calls the game's key callbacks.
+fn key_event<G: Game>(
+    ctx: &mut Context,
+    game: &mut G,
+    key: Key,
+    pressed: bool,
+    repeat: bool,
+    text: Option<&str>,
+) {
+    if pressed {
+        if !repeat || ctx.keyboard.key_repeat {
+            ctx.keyboard.press(key);
+            game.key_pressed(ctx, key, repeat);
+        }
+        if ctx.keyboard.text_input
+            && let Some(text) = text
+            && text.chars().any(|c| !c.is_control())
+        {
+            game.text_input(ctx, text);
+        }
+    } else {
+        ctx.keyboard.release(key);
+        game.key_released(ctx, key);
+    }
 }
 
 /// Reads controller events and replays them as `Game` callbacks.
@@ -260,6 +288,8 @@ struct App<G, F> {
     suspended: bool,
     /// The finger that acts as the mouse on mobile.
     mouse_finger: Option<TouchId>,
+    #[cfg(target_os = "android")]
+    android_input: crate::input::android::Reader,
 }
 
 /// Frame interval while the window is minimized (30 fps).
@@ -302,7 +332,7 @@ where
         let graphics = Graphics::new(window.clone(), event_loop.owned_display_handle(), conf)?;
         let mut ctx = Context {
             graphics,
-            keyboard: Keyboard::new(),
+            keyboard: Keyboard::new(window.clone()),
             mouse: Mouse::new(window.clone()),
             gamepad: Gamepads::new(),
             touch: Touch::new(),
@@ -348,6 +378,84 @@ where
             exit_app(event_loop);
         }
         if ctx.quit {
+            ctx.quit = false;
+            if !game.quit(ctx) {
+                exit_app(event_loop);
+            }
+        }
+    }
+
+    /// Updates the touch state and calls the game's touch callbacks, in logical pixels.
+    fn touch_event(&mut self, id: TouchId, phase: TouchPhase, x: f32, y: f32, pressure: f32) {
+        let Some((ctx, game)) = &mut self.state else {
+            return;
+        };
+        match phase {
+            TouchPhase::Started => {
+                ctx.touch.begin(id, vec2(x, y), pressure);
+                game.touch_pressed(ctx, id, x, y);
+            }
+            TouchPhase::Moved => {
+                if let Some(d) = ctx.touch.moved(id, vec2(x, y), pressure) {
+                    game.touch_moved(ctx, id, x, y, d.x, d.y);
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if ctx.touch.end(id, vec2(x, y), pressure) {
+                    game.touch_released(ctx, id, x, y);
+                }
+            }
+        }
+        if MOBILE {
+            self.emulate_mouse(id, phase, x, y);
+        }
+    }
+
+    /// Takes everything waiting in Android's input queue before winit can (see
+    /// `input/android.rs`). winit still reads what arrives in the moment between
+    /// this and its own read, so `window_event` keeps handling touches and keys.
+    #[cfg(target_os = "android")]
+    fn read_android_input(&mut self, event_loop: &ActiveEventLoop) {
+        use crate::input::android::Event;
+
+        let mut reader = std::mem::take(&mut self.android_input);
+        reader.drain(crate::platform::android_app(), |event| {
+            let Some((ctx, game)) = &mut self.state else {
+                return;
+            };
+            match event {
+                Event::Touch {
+                    id,
+                    phase,
+                    x,
+                    y,
+                    pressure,
+                } => {
+                    let scale = ctx.window.inner.scale_factor() as f32;
+                    self.touch_event(TouchId(id), phase, x / scale, y / scale, pressure);
+                }
+                Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    text,
+                } => {
+                    let mut buffer = [0; 4];
+                    let text = text.map(|c| &*c.encode_utf8(&mut buffer));
+                    key_event(ctx, game, key, pressed, repeat, text);
+                }
+                Event::PadButton {
+                    device,
+                    button,
+                    down,
+                } => ctx.gamepad.android_button(device, button, down),
+                Event::PadMotion(motion) => ctx.gamepad.android_motion(&motion),
+            }
+        });
+        self.android_input = reader;
+        if let Some((ctx, game)) = &mut self.state
+            && ctx.quit
+        {
             ctx.quit = false;
             if !game.quit(ctx) {
                 exit_app(event_loop);
@@ -417,12 +525,19 @@ where
         }
     }
 
+    #[cfg(target_os = "android")]
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        self.read_android_input(event_loop);
+    }
+
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.suspended = true;
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
         self.mouse_finger = None;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        ctx.gamepad.suspend();
         ctx.keyboard.release_all();
         ctx.mouse.release_all();
         ctx.touch.release_all();
@@ -473,35 +588,26 @@ where
                 game.focus(ctx, focused);
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let key = match event.physical_key {
+                let mut key = match event.physical_key {
                     PhysicalKey::Code(code) => Key::from_winit(code),
                     PhysicalKey::Unidentified(_) => Key::Unknown,
                 };
                 // Android's back gesture is its Escape key.
-                let key =
-                    if event.logical_key == NamedKey::BrowserBack && cfg!(target_os = "android") {
-                        Key::Escape
-                    } else {
-                        key
-                    };
-                match event.state {
-                    ElementState::Pressed => {
-                        if !event.repeat || ctx.keyboard.key_repeat {
-                            ctx.keyboard.press(key);
-                            game.key_pressed(ctx, key, event.repeat);
-                        }
-                        if ctx.keyboard.text_input
-                            && let Some(text) = &event.text
-                            && text.chars().any(|c| !c.is_control())
-                        {
-                            game.text_input(ctx, text);
-                        }
-                    }
-                    ElementState::Released => {
-                        ctx.keyboard.release(key);
-                        game.key_released(ctx, key);
-                    }
+                if cfg!(target_os = "android") && event.logical_key == NamedKey::BrowserBack {
+                    key = Key::Escape;
                 }
+                // iOS's on-screen keyboard sends Return as a character.
+                if cfg!(target_os = "ios") && event.logical_key.to_text() == Some("\n") {
+                    key = Key::Enter;
+                }
+                key_event(
+                    ctx,
+                    game,
+                    key,
+                    event.state == ElementState::Pressed,
+                    event.repeat,
+                    event.text.as_deref(),
+                );
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f32>(ctx.window.inner.scale_factor());
@@ -537,26 +643,7 @@ where
                     .location
                     .to_logical::<f32>(ctx.window.inner.scale_factor());
                 let pressure = touch.force.map_or(1.0, |f| f.normalized() as f32);
-                let id = TouchId(touch.id);
-                match touch.phase {
-                    TouchPhase::Started => {
-                        ctx.touch.begin(id, vec2(p.x, p.y), pressure);
-                        game.touch_pressed(ctx, id, p.x, p.y);
-                    }
-                    TouchPhase::Moved => {
-                        if let Some(d) = ctx.touch.moved(id, vec2(p.x, p.y), pressure) {
-                            game.touch_moved(ctx, id, p.x, p.y, d.x, d.y);
-                        }
-                    }
-                    TouchPhase::Ended | TouchPhase::Cancelled => {
-                        if ctx.touch.end(id, vec2(p.x, p.y), pressure) {
-                            game.touch_released(ctx, id, p.x, p.y);
-                        }
-                    }
-                }
-                if MOBILE {
-                    self.emulate_mouse(id, touch.phase, p.x, p.y);
-                }
+                self.touch_event(TouchId(touch.id), touch.phase, p.x, p.y, pressure);
             }
             WindowEvent::DroppedFile(path) => game.file_dropped(ctx, path),
             _ => {}

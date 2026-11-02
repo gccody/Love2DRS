@@ -56,6 +56,8 @@ pub struct Project {
     pub version_code: u64,
     pub orientation: Orientation,
     pub assets: Vec<PathBuf>,
+    /// A square PNG, relative to the package root.
+    pub icon: Option<PathBuf>,
     pub min_sdk: u64,
     pub target_sdk: u64,
     pub permissions: Vec<String>,
@@ -99,6 +101,11 @@ impl Project {
             .unwrap_or_default();
         check_assets(&root, &assets)?;
 
+        let icon = settings["icon"].as_str().map(PathBuf::from);
+        if let Some(icon) = &icon {
+            check_assets(&root, std::slice::from_ref(icon))?;
+        }
+
         let version = text(&package["version"]);
         let app_id = match settings["app_id"].as_str() {
             // Examples share the package's settings but are separate apps.
@@ -123,6 +130,7 @@ impl Project {
             version,
             orientation: parse_orientation(settings["orientation"].as_str())?,
             assets,
+            icon,
             min_sdk: settings["min_sdk"].as_u64().unwrap_or(26),
             target_sdk: settings["target_sdk"].as_u64().unwrap_or(36),
             permissions: settings["permissions"]

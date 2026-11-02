@@ -95,8 +95,75 @@ fn build_app(project: &Project, options: &Options) -> Result<PathBuf, String> {
         }
         copy(&file, &dest)?;
     }
+    if let Some(icon) = &project.icon {
+        compile_icon(project, options, &project.root.join(icon), &app)?;
+    }
     sign(&app, options)?;
     Ok(app)
+}
+
+/// Compiles the icon with Xcode's asset catalog compiler, which writes it into
+/// the bundle, and adds the entries it asks for to `Info.plist`.
+fn compile_icon(
+    project: &Project,
+    options: &Options,
+    icon: &Path,
+    app: &Path,
+) -> Result<(), String> {
+    let work = app.with_extension("icon");
+    let set = work.join("Assets.xcassets/AppIcon.appiconset");
+    if work.exists() {
+        std::fs::remove_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    }
+    std::fs::create_dir_all(&set).map_err(|e| format!("{}: {e}", set.display()))?;
+    let write_err = |e: &dyn std::fmt::Display| format!("can't write the icon: {e}");
+    crate::icon::app_store_icon(&crate::icon::load(icon)?)
+        .save(set.join("icon.png"))
+        .map_err(|e| write_err(&e))?;
+    std::fs::write(
+        set.join("Contents.json"),
+        r#"{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}"#,
+    )
+    .map_err(|e| write_err(&e))?;
+    let catalog = work.join("Assets.xcassets");
+    std::fs::write(
+        catalog.join("Contents.json"),
+        r#"{"info":{"author":"xcode","version":1}}"#,
+    )
+    .map_err(|e| write_err(&e))?;
+
+    let partial = work.join("partial.plist");
+    let platform = if options.physical {
+        "iphoneos"
+    } else {
+        "iphonesimulator"
+    };
+    run(
+        Command::new("xcrun")
+            .arg("actool")
+            .arg("--compile")
+            .arg(app)
+            .args(["--platform", platform])
+            .args([
+                "--minimum-deployment-target",
+                &project.ios_deployment_target,
+            ])
+            .args(["--app-icon", "AppIcon"])
+            .arg("--output-partial-info-plist")
+            .arg(&partial)
+            .args(["--target-device", "iphone", "--target-device", "ipad"])
+            .args(["--output-format", "human-readable-text"])
+            .arg(&catalog)
+            .stdout(Stdio::null()),
+        "",
+    )?;
+    run(
+        Command::new("/usr/libexec/PlistBuddy")
+            .arg("-c")
+            .arg(format!("Merge {}", partial.display()))
+            .arg(app.join("Info.plist")),
+        "",
+    )
 }
 
 fn copy(from: &Path, to: &Path) -> Result<(), String> {
@@ -178,6 +245,15 @@ fn info_plist(project: &Project, physical: bool) -> String {
     </array>
     <key>CFBundleVersion</key>
     <string>{code}</string>
+    <key>GCSupportedGameControllers</key>
+    <array>
+        <dict>
+            <key>ProfileName</key>
+            <string>ExtendedGamepad</string>
+        </dict>
+    </array>
+    <key>GCSupportsControllerUserInteraction</key>
+    <true/>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
@@ -345,6 +421,7 @@ mod tests {
             min_sdk: 26,
             target_sdk: 36,
             permissions: vec![],
+            icon: None,
             ios_deployment_target: "15.0".into(),
         }
     }

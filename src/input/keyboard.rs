@@ -1,6 +1,9 @@
 //! Keyboard state (the `love.keyboard` equivalent).
 
+use std::sync::Arc;
+
 use winit::keyboard::KeyCode;
+use winit::window::Window as WinitWindow;
 
 /// A physical key, named after its position on a US QWERTY layout
 /// (so `Key::W` is the same physical key on AZERTY keyboards). Use the
@@ -566,11 +569,14 @@ pub struct Keyboard {
     released: [bool; KEY_COUNT],
     pub(crate) key_repeat: bool,
     pub(crate) text_input: bool,
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    window: Arc<WinitWindow>,
 }
 
 impl Keyboard {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(window: Arc<WinitWindow>) -> Self {
         Keyboard {
+            window,
             down: [false; KEY_COUNT],
             pressed: [false; KEY_COUNT],
             released: [false; KEY_COUNT],
@@ -635,6 +641,39 @@ impl Keyboard {
     /// Enable or disable `text_input` callbacks (on by default).
     pub fn set_text_input(&mut self, enabled: bool) {
         self.text_input = enabled;
+    }
+
+    /// Shows or hides the on-screen keyboard on Android and iOS, and does
+    /// nothing on desktop. Typing arrives through the `text_input` callback, and
+    /// `Key::Backspace` and `Key::Enter` through `key_pressed`. While the keyboard
+    /// is up, [`safe_area`](crate::window::Window::safe_area) leaves it out, so
+    /// keep your text field inside that.
+    ///
+    /// The user can also close the keyboard without the game finding out, and
+    /// Android may not show it while a hardware keyboard is connected.
+    ///
+    /// On Android, love2drs only receives text that maps to key presses, which
+    /// covers Latin letters, digits and punctuation. Emoji, other scripts and
+    /// autocorrect or swipe typing may not arrive there.
+    pub fn set_screen_keyboard(&mut self, visible: bool) {
+        #[cfg(target_os = "android")]
+        {
+            let app = crate::platform::android_app();
+            if visible {
+                app.show_soft_input(false);
+            } else {
+                app.hide_soft_input(false);
+            }
+        }
+        #[cfg(target_os = "ios")]
+        self.window.set_ime_allowed(visible);
+        let _ = visible;
+    }
+
+    /// Whether this platform has an on-screen keyboard
+    /// (`love.keyboard.hasScreenKeyboard`).
+    pub fn has_screen_keyboard(&self) -> bool {
+        crate::platform::MOBILE
     }
 
     pub(crate) fn press(&mut self, key: Key) {

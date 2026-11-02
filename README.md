@@ -179,6 +179,7 @@ app_id = "com.example.mygame"    # default: com.love2drs.<name>
 name = "My Game"                 # default: the Cargo name
 assets = ["assets"]              # directories or files to package, from the package root
 orientation = "landscape"        # landscape, portrait or any (the default)
+icon = "assets/icon.png"         # square PNG, 1024x1024 is best; default: the OS's blank icon
 version_code = 3                 # default: derived from the version, 1.2.3 becomes 10203
 min_sdk = 26                     # Android
 target_sdk = 36                  # Android
@@ -194,6 +195,14 @@ ios_deployment_target = "15.0"   # iOS
   clipped on a phone; `examples/mobile.rs` is the one written for it.
 - **Touch is the main input.** The first finger also acts as the left mouse button, so mouse-only games
   work, and Android's back gesture arrives as `Key::Escape`.
+- **Controllers** use the same `ctx.gamepad` API as on desktop, including rumble. Whether a controller
+  can rumble depends on the controller and OS version, so check `is_vibration_supported()`. Android needs
+  no permission prompt for this; the tool declares `VIBRATE` for you.
+- **The on-screen keyboard** opens with `ctx.keyboard.set_screen_keyboard(true)`. Typing reaches `text_input`,
+  and `Key::Backspace` and `Key::Enter` reach `key_pressed`. `safe_area()` shrinks while it's up, so keep your text
+  field inside that. The user can close it without the game finding out, so show it again when a text field is
+  tapped. On Android, love2drs only receives text that maps to key presses, which covers Latin letters, digits
+  and punctuation. Emoji, other scripts and autocorrect or swipe typing may not arrive. iOS has no such limit.
 - **Files:** `new_image("assets/player.png")` and the other loaders find packaged assets at the same
   path as on desktop. For your own data files, use `love2drs::filesystem::read`, because `std::fs` can't
   see packaged files. The working directory is `love2drs::filesystem::save_dir()`, so writing to a relative path
@@ -206,16 +215,15 @@ ios_deployment_target = "15.0"   # iOS
   On iOS, nothing collects `log` output unless you install a logger, but panics and startup errors reach stderr,
   which `cargo love2drs ios run` shows.
 
-**Not supported yet:** gamepads (`ctx.gamepad` stays empty), rumble, the on-screen keyboard (so `text_input`
-only hears hardware keyboards), app icons, and store packaging. Google Play needs an `.aab`, which the tool doesn't
-make, and App Store uploads need an `.ipa` from Xcode.
+**Not supported yet:** store packaging. Google Play needs an `.aab`, which the tool doesn't make, and App Store
+uploads need an `.ipa` from Xcode.
 
 ## Cargo features
 
 | feature | default | |
 |---|---|---|
 | `audio` | yes | sound via [rodio](https://crates.io/crates/rodio) (wav, ogg vorbis, mp3, flac) |
-| `gamepad` | yes | controllers via [gilrs](https://crates.io/crates/gilrs); without it `ctx.gamepad` reports none |
+| `gamepad` | yes | controllers and rumble on every platform; without it `ctx.gamepad` reports none |
 | `png` | yes | PNG decoding and screenshots |
 | `jpeg` | yes | JPEG decoding |
 
@@ -232,6 +240,8 @@ make, and App Store uploads need an `.ipa` from Xcode.
   Edge) rumble on Windows and macOS too, over USB or Bluetooth: love2drs reads and drives them
   directly over HID there, since the OS gamepad APIs can't rumble them. Other controllers can't
   rumble on macOS, so `set_vibration` returns `false` for them.
+  Android reads controllers through its input queue and Java APIs, and iOS through the GameController and
+  CoreHaptics frameworks. On both, held buttons are released and rumble stops when the app is suspended.
 - **Touch** events come from touchscreens on Android, iOS, Windows and Linux. macOS has no touchscreens:
   trackpad gestures arrive as mouse and wheel events, so `ctx.touch` stays empty there. The first finger
   also drives emulated mouse events, so a tap reaches both `touch_pressed` and `mouse_pressed`.
@@ -283,7 +293,7 @@ skills/love2drs/    agent skill (SKILL.md + API reference + recipes)
 
 ## Roadmap ideas
 
-Gamepads and the on-screen keyboard on mobile, store packaging, streaming playback for long music tracks,
+Store packaging, full text input on Android, streaming playback for long music tracks,
 stencil support, multiple render targets, a retained `Text` object, a save directory on desktop, and
 WebAssembly support.
 

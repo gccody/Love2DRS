@@ -310,6 +310,8 @@ shift() ctrl() alt() -> bool
 axis(negative: Key, positive: Key) -> f32              // -1, 0, 1
 set_key_repeat(bool)  has_key_repeat()                 // repeat key_pressed events (default off)
 set_text_input(bool)                                   // text_input callbacks (default on)
+set_screen_keyboard(bool)                              // on-screen keyboard on Android and iOS, else no-op
+has_screen_keyboard() -> bool                          // true on Android and iOS
 ```
 `Key` variants: `A..Z`, `Num0..Num9`, `F1..F12`, `Up Down Left Right`, `Space Enter Escape Tab
 Backspace Delete Insert Home End PageUp PageDown`, `LShift RShift LCtrl RCtrl LAlt RAlt LSuper
@@ -377,7 +379,7 @@ delta() -> f32   fps() -> f32   average_delta() -> f32   time() -> f64   frame_c
 title() set_title(impl Into<String>)  size() -> (f32, f32)  set_size(w: u32, h: u32)
 scale_factor() -> f64  set_fullscreen(bool) is_fullscreen()  set_resizable(bool)
 has_focus()  minimize()  is_minimized()  maximize()  winit() -> &winit::window::Window
-safe_area() -> (f32, f32, f32, f32)   // x, y, w, h clear of notches and system bars (love.window.getSafeArea)
+safe_area() -> (f32, f32, f32, f32)   // x, y, w, h clear of notches, system bars and the on-screen keyboard (love.window.getSafeArea)
 ```
 While minimized the game keeps running, capped at 30 fps.
 

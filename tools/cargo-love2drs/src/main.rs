@@ -1,6 +1,7 @@
 //! `cargo love2drs`: builds, installs and runs love2drs games on Android and iOS.
 
 mod android;
+mod icon;
 mod ios;
 mod project;
 
@@ -45,6 +46,7 @@ for the app itself live in the game's Cargo.toml:
     app_id = \"com.example.mygame\"    # default: com.love2drs.<name>
     name = \"My Game\"                 # default: the Cargo name
     assets = [\"assets\"]              # files to package, from the package root
+    icon = \"assets/icon.png\"         # square PNG, 1024x1024 or larger is best
     orientation = \"landscape\"        # landscape, portrait or any (default)
     version_code = 3                 # default: derived from the version
     min_sdk = 26                     # Android
