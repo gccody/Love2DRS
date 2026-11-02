@@ -530,6 +530,10 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     let build_info = build_info.map(BuildInfo::plist_entries).unwrap_or_default();
     // An empty `UILaunchScreen` is what asks for the whole screen. Without one,
     // iOS runs the app letterboxed at an old iPhone's resolution.
+    //
+    // `UIApplicationSceneManifest` adopts the UIScene lifecycle, which iOS 27 demands
+    // of apps built with its SDK, stopping them at launch otherwise. winit attaches
+    // its window to the scene, so no scene delegate or configuration is needed.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -570,6 +574,11 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     <true/>
     <key>MinimumOSVersion</key>
     <string>{min_os}</string>
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+    </dict>
     <key>UIDeviceFamily</key>
     <array>
         <integer>1</integer>
@@ -755,6 +764,16 @@ mod tests {
         let plist = info_plist(&project(Orientation::Landscape), true, None);
         assert!(plist.contains("<string>iPhoneOS</string>"));
         assert!(!plist.contains("UIInterfaceOrientationPortrait"));
+    }
+
+    #[test]
+    fn plist_adopts_the_scene_lifecycle() {
+        let manifest = "<key>UIApplicationSceneManifest</key>\n    <dict>\n        \
+                        <key>UIApplicationSupportsMultipleScenes</key>\n        <false/>\n    \
+                        </dict>";
+        for physical in [false, true] {
+            assert!(info_plist(&project(Orientation::Any), physical, None).contains(manifest));
+        }
     }
 
     #[test]
