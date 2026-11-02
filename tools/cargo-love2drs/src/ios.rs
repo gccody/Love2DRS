@@ -532,8 +532,10 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     // iOS runs the app letterboxed at an old iPhone's resolution.
     //
     // `UIApplicationSceneManifest` adopts the UIScene lifecycle, which iOS 27 demands
-    // of apps built with its SDK, stopping them at launch otherwise. winit attaches
-    // its window to the scene, so no scene delegate or configuration is needed.
+    // of apps built with its SDK, stopping them at launch otherwise. The manifest only
+    // counts if it lists a configuration: iOS 27 still stops an app whose manifest has
+    // nothing but `UIApplicationSupportsMultipleScenes`. The configuration names no
+    // delegate because winit attaches its window to the scene itself.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -578,6 +580,16 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     <dict>
         <key>UIApplicationSupportsMultipleScenes</key>
         <false/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>Default Configuration</string>
+                </dict>
+            </array>
+        </dict>
     </dict>
     <key>UIDeviceFamily</key>
     <array>
@@ -768,11 +780,19 @@ mod tests {
 
     #[test]
     fn plist_adopts_the_scene_lifecycle() {
-        let manifest = "<key>UIApplicationSceneManifest</key>\n    <dict>\n        \
-                        <key>UIApplicationSupportsMultipleScenes</key>\n        <false/>\n    \
-                        </dict>";
         for physical in [false, true] {
-            assert!(info_plist(&project(Orientation::Any), physical, None).contains(manifest));
+            let plist = info_plist(&project(Orientation::Any), physical, None);
+            for expected in [
+                "<key>UIApplicationSceneManifest</key>\n    <dict>",
+                "<key>UIApplicationSupportsMultipleScenes</key>\n        <false/>",
+                // iOS 27 doesn't count a manifest without a configuration as adopting.
+                "<key>UIWindowSceneSessionRoleApplication</key>\n            <array>\n                \
+                 <dict>\n                    <key>UISceneConfigurationName</key>",
+            ] {
+                assert!(plist.contains(expected), "missing {expected}");
+            }
+            // winit attaches its own window, and there's no delegate class to name.
+            assert!(!plist.contains("UISceneDelegateClassName"));
         }
     }
 
