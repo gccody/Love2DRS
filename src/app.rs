@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 use crate::graphics::Graphics;
@@ -14,6 +14,7 @@ use crate::input::{
     TouchId,
 };
 use crate::math::vec2;
+use crate::platform::MOBILE;
 use crate::timer::Timer;
 use crate::window::Window;
 use crate::{Conf, Error, Result};
@@ -116,6 +117,19 @@ pub trait Game: 'static {
     /// buttons are released when focus is lost.
     fn focus(&mut self, ctx: &mut Context, focused: bool) {}
 
+    /// The app went to the background on Android or iOS, or a system overlay
+    /// took over. Save progress here: the OS may end a suspended app without
+    /// further notice. `update` and `draw` stop until [`resumed`](Game::resumed)
+    /// and sounds are silenced. Never called on desktop.
+    fn suspended(&mut self, ctx: &mut Context) {}
+
+    /// The app came back after [`suspended`](Game::suspended).
+    fn resumed(&mut self, ctx: &mut Context) {}
+
+    /// The OS is short of memory (`love.lowmemory`). Free what you can, or a
+    /// suspended app may be ended.
+    fn low_memory(&mut self, ctx: &mut Context) {}
+
     /// Files dropped onto the window.
     fn file_dropped(&mut self, ctx: &mut Context, path: std::path::PathBuf) {}
 
@@ -130,6 +144,8 @@ pub trait Game: 'static {
 ///
 /// `load` runs once the window and GPU are ready, like `love.load`, and
 /// builds your game state.
+///
+/// On iOS this never returns: an error is printed and ends the process instead.
 ///
 /// ```no_run
 /// use love2drs::prelude::*;
@@ -151,7 +167,16 @@ where
     G: Game,
     F: FnOnce(&mut Context) -> Result<G>,
 {
-    let event_loop = EventLoop::new().map_err(|e| Error::Window(e.to_string()))?;
+    #[cfg(not(target_os = "android"))] // android_main! has already done this
+    crate::platform::init();
+    #[allow(unused_mut)]
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "android")]
+    {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+        builder.with_android_app(crate::platform::android_app().clone());
+    }
+    let event_loop = builder.build().map_err(|e| Error::Window(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::<G, F> {
         conf,
@@ -160,6 +185,8 @@ where
         error: None,
         autoshot: AutoShot::from_env(),
         last_frame: Instant::now(),
+        suspended: false,
+        mouse_finger: None,
     };
     event_loop
         .run_app(&mut app)
@@ -168,6 +195,15 @@ where
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Ends the event loop. iOS ignores `exit`, as apps aren't meant to quit
+/// themselves, so a game that asks to has to end the process.
+fn exit_app(event_loop: &ActiveEventLoop) {
+    if cfg!(target_os = "ios") {
+        std::process::exit(0);
+    }
+    event_loop.exit();
 }
 
 /// Reads controller events and replays them as `Game` callbacks.
@@ -220,6 +256,10 @@ struct App<G, F> {
     error: Option<Error>,
     autoshot: AutoShot,
     last_frame: Instant,
+    /// The app is in the background, so nothing may be drawn.
+    suspended: bool,
+    /// The finger that acts as the mouse on mobile.
+    mouse_finger: Option<TouchId>,
 }
 
 /// Frame interval while the window is minimized (30 fps).
@@ -234,11 +274,22 @@ where
         let conf = &self.conf;
         let mut attrs = WindowAttributes::default()
             .with_title(conf.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(conf.width, conf.height))
             .with_resizable(conf.resizable)
             .with_visible(false);
-        if let Some((w, h)) = conf.min_size {
-            attrs = attrs.with_min_inner_size(winit::dpi::LogicalSize::new(w, h));
+        // A phone's window always fills the screen. iOS would otherwise honor
+        // the size and leave part of the screen black.
+        if !MOBILE {
+            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(conf.width, conf.height));
+            if let Some((w, h)) = conf.min_size {
+                attrs = attrs.with_min_inner_size(winit::dpi::LogicalSize::new(w, h));
+            }
+        }
+        #[cfg(target_os = "ios")]
+        {
+            use winit::platform::ios::WindowAttributesExtIOS;
+            attrs = attrs
+                .with_prefers_status_bar_hidden(true)
+                .with_prefers_home_indicator_hidden(true);
         }
         if conf.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -269,6 +320,9 @@ where
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        if self.suspended {
+            return;
+        }
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
@@ -291,14 +345,52 @@ where
         ctx.graphics.end_frame();
 
         if self.autoshot.path.is_some() && ctx.timer.frame_count() >= self.autoshot.frame {
-            event_loop.exit();
+            exit_app(event_loop);
         }
         if ctx.quit {
             ctx.quit = false;
             if !game.quit(ctx) {
-                event_loop.exit();
+                exit_app(event_loop);
             }
         }
+    }
+
+    /// Drives the mouse with the first finger on mobile, as the OS does for
+    /// touchscreens on desktop, so mouse-only games work on a phone.
+    fn emulate_mouse(&mut self, id: TouchId, phase: TouchPhase, x: f32, y: f32) {
+        let Some((ctx, game)) = &mut self.state else {
+            return;
+        };
+        match phase {
+            TouchPhase::Started if self.mouse_finger.is_none() => {
+                self.mouse_finger = Some(id);
+                let d = ctx.mouse.moved(vec2(x, y));
+                game.mouse_moved(ctx, x, y, d.x, d.y);
+                ctx.mouse.press(MouseButton::Left);
+                game.mouse_pressed(ctx, x, y, MouseButton::Left);
+            }
+            TouchPhase::Moved if self.mouse_finger == Some(id) => {
+                let d = ctx.mouse.moved(vec2(x, y));
+                game.mouse_moved(ctx, x, y, d.x, d.y);
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled if self.mouse_finger == Some(id) => {
+                self.mouse_finger = None;
+                ctx.mouse.release(MouseButton::Left);
+                game.mouse_released(ctx, x, y, MouseButton::Left);
+            }
+            _ => {}
+        }
+    }
+
+    /// Stops after a failure to start or resume. `run_app` never returns on
+    /// iOS, so `run` could never report an error stored there.
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: Error) {
+        if cfg!(target_os = "ios") {
+            eprintln!("love2drs: {error}");
+            std::process::exit(1);
+        }
+        self.error = Some(error);
+        event_loop.exit();
     }
 }
 
@@ -308,12 +400,41 @@ where
     F: FnOnce(&mut Context) -> Result<G>,
 {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_none()
-            && self.error.is_none()
-            && let Err(e) = self.init(event_loop)
-        {
-            self.error = Some(e);
-            event_loop.exit();
+        if self.error.is_some() {
+            return;
+        }
+        self.suspended = false;
+        let result = match &mut self.state {
+            None => self.init(event_loop),
+            Some((ctx, game)) => ctx.graphics.resume().map(|()| {
+                #[cfg(feature = "audio")]
+                crate::audio::set_suspended(false);
+                game.resumed(ctx);
+            }),
+        };
+        if let Err(e) = result {
+            self.fail(event_loop, e);
+        }
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.suspended = true;
+        let Some((ctx, game)) = &mut self.state else {
+            return;
+        };
+        self.mouse_finger = None;
+        ctx.keyboard.release_all();
+        ctx.mouse.release_all();
+        ctx.touch.release_all();
+        #[cfg(feature = "audio")]
+        crate::audio::set_suspended(true);
+        game.suspended(ctx);
+        ctx.graphics.suspend();
+    }
+
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some((ctx, game)) = &mut self.state {
+            game.low_memory(ctx);
         }
     }
 
@@ -328,7 +449,7 @@ where
         match event {
             WindowEvent::CloseRequested => {
                 if !game.quit(ctx) {
-                    event_loop.exit();
+                    exit_app(event_loop);
                 }
             }
             WindowEvent::Resized(size) => {
@@ -340,7 +461,7 @@ where
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                let size = ctx.window.inner.inner_size();
+                let size = crate::window::drawable_size(&ctx.window.inner);
                 ctx.graphics.resize(size.width, size.height, scale_factor);
             }
             WindowEvent::Focused(focused) => {
@@ -356,6 +477,13 @@ where
                     PhysicalKey::Code(code) => Key::from_winit(code),
                     PhysicalKey::Unidentified(_) => Key::Unknown,
                 };
+                // Android's back gesture is its Escape key.
+                let key =
+                    if event.logical_key == NamedKey::BrowserBack && cfg!(target_os = "android") {
+                        Key::Escape
+                    } else {
+                        key
+                    };
                 match event.state {
                     ElementState::Pressed => {
                         if !event.repeat || ctx.keyboard.key_repeat {
@@ -426,14 +554,20 @@ where
                         }
                     }
                 }
+                if MOBILE {
+                    self.emulate_mouse(id, touch.phase, p.x, p.y);
+                }
             }
             WindowEvent::DroppedFile(path) => game.file_dropped(ctx, path),
             _ => {}
         }
+        let Some((ctx, game)) = &mut self.state else {
+            return;
+        };
         if ctx.quit {
             ctx.quit = false;
             if !game.quit(ctx) {
-                event_loop.exit();
+                exit_app(event_loop);
             }
         }
     }
@@ -442,6 +576,11 @@ where
         let Some((ctx, _)) = &self.state else {
             return;
         };
+        // The OS forbids drawing in the background. Sleep until `resumed`.
+        if self.suspended {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         // Nothing is presented while minimized, so vsync no longer paces the
         // loop. Keep the game running, but at a capped rate.
         if ctx.window.is_minimized() {

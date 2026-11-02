@@ -719,3 +719,67 @@ On Windows PowerShell: `$env:LOVE2DRS_SCREENSHOT="target/shot.png"; cargo run --
 This requires a GPU (or a software adapter such as Mesa llvmpipe / WARP) and a display session.
 On Linux CI, wrap the command in `xvfb-run`. Look at the PNG, or compare it against a
 reference image, to verify rendering.
+
+## 14. Running on Android and iOS
+
+```toml
+# Cargo.toml
+[package.metadata.love2drs]
+app_id = "com.example.mygame"
+name = "My Game"
+assets = ["assets"]        # packaged at the same path, so new_image("assets/x.png") still works
+orientation = "landscape"  # landscape, portrait or any
+```
+
+```rust
+use love2drs::prelude::*;
+
+const SAVE_FILE: &str = "save.txt"; // relative paths are in the save directory on mobile
+
+struct MyGame {
+    score: u32,
+}
+
+impl Game for MyGame {
+    fn draw(&mut self, ctx: &mut Context) {
+        // A phone's window has no fixed size, and part of it may be covered.
+        let (x, y, w, _h) = ctx.window.safe_area();
+        let g = &mut ctx.graphics;
+        g.printf(&format!("Score: {}", self.score), x, y + 12.0, w, Align::Center);
+    }
+
+    fn touch_pressed(&mut self, _ctx: &mut Context, _id: TouchId, _x: f32, _y: f32) {
+        self.score += 1;
+    }
+
+    // The OS may end the app after this without telling it.
+    fn suspended(&mut self, _ctx: &mut Context) {
+        let _ = std::fs::write(SAVE_FILE, self.score.to_string());
+    }
+
+    // Android's back gesture arrives as Escape.
+    fn key_pressed(&mut self, ctx: &mut Context, key: Key, _repeat: bool) {
+        if key == Key::Escape {
+            ctx.quit();
+        }
+    }
+}
+
+fn main() -> love2drs::Result {
+    love2drs::run(Conf::new("My Game"), |_ctx| {
+        let score = std::fs::read_to_string(SAVE_FILE)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0);
+        Ok(MyGame { score })
+    })
+}
+
+love2drs::android_main!(main);
+```
+
+```sh
+cargo install --git https://github.com/gccody/Love2DRS cargo-love2drs
+cargo love2drs android run   # phone or running emulator
+cargo love2drs ios run       # Simulator, on a Mac
+```

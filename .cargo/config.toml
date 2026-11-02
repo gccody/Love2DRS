@@ -1,0 +1,3 @@
+[alias]
+# Lets this repo use its own packaging tool without installing it.
+love2drs = "run --quiet -p cargo-love2drs --"

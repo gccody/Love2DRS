@@ -49,7 +49,7 @@ opt-level = 2
 Cargo only applies `[profile.*]` settings from your own `Cargo.toml`, not from a
 dependency's, so this has to go in your game's manifest. Rust 1.88 or newer is required.
 
-love2drs runs on Windows, macOS and Linux (X11 and Wayland). On Linux, building needs a few
+love2drs runs on Windows, macOS, Linux (X11 and Wayland), [Android and iOS](#android-and-ios). On Linux, building needs a few
 system headers: `sudo apt install pkg-config libudev-dev libasound2-dev` on Debian/Ubuntu, or
 `sudo dnf install pkgconf systemd-devel alsa-lib-devel` on Fedora. `libudev-dev` is for the
 `gamepad` feature and `libasound2-dev` for `audio`; drop either feature to skip its headers.
@@ -66,10 +66,11 @@ cargo run --release --example starfall        # arcade game: catch stars, dodge 
 cargo run --release --example platformer      # pixel-art platformer (canvas + sprite batch)
 cargo run --example shaders                   # custom WGSL pixel shaders / post effects
 cargo run --example input                     # gamepad / touch / event tester
+cargo run --example mobile                    # touch, rotation, assets and saving, for phones
 cargo run --release --example spritemark -- 100000   # renderer stress test
 ```
 
-Every example generates its art and sound in code, so none of them need asset files.
+Apart from the logo in `mobile`, the examples generate their art and sound in code, so they don't need asset files.
 
 ## What's in the box
 
@@ -87,6 +88,8 @@ Every example generates its art and sound in code, so none of them need asset fi
 | `love.timer` | `ctx.timer` (`delta`, `fps`, `time`) |
 | `love.window` | `ctx.window` (title, size, fullscreen, ...) |
 | `love.math` | `love2drs::math` (`random*`, seedable `Rng`, `noise2`, `Transform`, `Vec2`) |
+| `love.filesystem` | `love2drs::filesystem` (`read`, `save_dir`) |
+| `love.lowmemory`, app suspend and resume | `Game::low_memory`, `suspended`, `resumed` |
 | `conf.lua` | `Conf::new("title").size(1280, 720).msaa(4).vsync(false)` |
 
 Some differences from LÖVE:
@@ -133,6 +136,80 @@ At 100,000 sprites a frame is roughly 1.5 ms of recording the draws, 0.8 ms of u
 instances (48 bytes per sprite) and 0.25 ms of the example's own update loop.
 For geometry that doesn't move, a `SpriteBatch` avoids that cost entirely.
 
+## Android and iOS
+
+Add one line next to `fn main`. It does nothing on other platforms:
+
+```rust
+fn main() -> love2drs::Result {
+    love2drs::run(Conf::new("Hello"), |_ctx| Ok(Hello { pos: vec2(200.0, 300.0) }))
+}
+
+love2drs::android_main!(main);
+```
+
+Then build, install and run the game with the `cargo-love2drs` tool:
+
+```sh
+cargo install --git https://github.com/gccody/Love2DRS cargo-love2drs
+
+cargo love2drs android run                    # on a connected phone or running emulator
+cargo love2drs android build --release        # makes an .apk for arm64 and x86_64
+cargo love2drs ios run                        # on the iOS Simulator
+cargo love2drs ios build --physical --release # makes an .app for a real iPhone or iPad
+```
+
+Add `--bin <name>` or `--example <name>` to choose what to build. Inside this repo no install is
+needed, so try `cargo love2drs android run --example mobile`. `cargo love2drs` with no arguments
+lists every option. Apps are written to `target/love2drs/`.
+
+**What you need:**
+
+- **Android**, on any desktop OS: the Android SDK and NDK from Android Studio's SDK Manager, a JDK, and
+  `rustup target add aarch64-linux-android x86_64-linux-android`. Gradle isn't needed. Android 8 (API 26) or newer.
+- **iOS**, on macOS only: Xcode, and `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`.
+  iOS 15 or newer. To install on a real device, pass `--device <UDID> --identity <NAME> --profile <PATH>`
+  with a signing identity and provisioning profile from your Apple developer account.
+
+**App settings** go in your game's `Cargo.toml`. All of them are optional:
+
+```toml
+[package.metadata.love2drs]
+app_id = "com.example.mygame"    # default: com.love2drs.<name>
+name = "My Game"                 # default: the Cargo name
+assets = ["assets"]              # directories or files to package, from the package root
+orientation = "landscape"        # landscape, portrait or any (the default)
+version_code = 3                 # default: derived from the version, 1.2.3 becomes 10203
+min_sdk = 26                     # Android
+target_sdk = 36                  # Android
+permissions = ["android.permission.INTERNET"]  # Android
+ios_deployment_target = "15.0"   # iOS
+```
+
+**How a phone differs from a desktop:**
+
+- **The window always fills the screen**, so `Conf::size` is ignored. Lay out from `ctx.graphics.width()`
+  and `height()`, handle `Game::resize` for rotation, and keep controls inside `ctx.window.safe_area()`,
+  away from notches and gesture bars. Most of the bundled examples use fixed desktop layouts and get
+  clipped on a phone; `examples/mobile.rs` is the one written for it.
+- **Touch is the main input.** The first finger also acts as the left mouse button, so mouse-only games
+  work, and Android's back gesture arrives as `Key::Escape`.
+- **Files:** `new_image("assets/player.png")` and the other loaders find packaged assets at the same
+  path as on desktop. For your own data files, use `love2drs::filesystem::read`, because `std::fs` can't
+  see packaged files. The working directory is `love2drs::filesystem::save_dir()`, so writing to a relative path
+  with `std::fs` saves there.
+- **The OS can end the app at any time** once it's in the background. `Game::suspended` is your last chance to
+  save. `update` and `draw` stop and sounds are silenced until `Game::resumed`.
+- **`ctx.quit()` ends the app**, even on iOS, where apps normally don't quit themselves. Apple's review guidelines
+  discourage offering this, so don't show a quit button in an iOS game.
+- **Logs:** on Android, `log` output goes to logcat under the `love2drs` tag, and `cargo love2drs android run` follows it.
+  On iOS, nothing collects `log` output unless you install a logger, but panics and startup errors reach stderr,
+  which `cargo love2drs ios run` shows.
+
+**Not supported yet:** gamepads (`ctx.gamepad` stays empty), rumble, the on-screen keyboard (so `text_input`
+only hears hardware keyboards), app icons, and store packaging. Google Play needs an `.aab`, which the tool doesn't
+make, and App Store uploads need an `.ipa` from Xcode.
+
 ## Cargo features
 
 | feature | default | |
@@ -155,9 +232,9 @@ For geometry that doesn't move, a `SpriteBatch` avoids that cost entirely.
   Edge) rumble on Windows and macOS too, over USB or Bluetooth: love2drs reads and drives them
   directly over HID there, since the OS gamepad APIs can't rumble them. Other controllers can't
   rumble on macOS, so `set_vibration` returns `false` for them.
-- **Touch** events come from touchscreens on Windows and Linux. macOS has no touchscreens: trackpad
-  gestures arrive as mouse and wheel events, so `ctx.touch` stays empty there. The OS also sends
-  emulated mouse events for the first finger, so a tap reaches both `touch_pressed` and `mouse_pressed`.
+- **Touch** events come from touchscreens on Android, iOS, Windows and Linux. macOS has no touchscreens:
+  trackpad gestures arrive as mouse and wheel events, so `ctx.touch` stays empty there. The first finger
+  also drives emulated mouse events, so a tap reaches both `touch_pressed` and `mouse_pressed`.
 
 ## Screenshot testing
 
@@ -184,6 +261,8 @@ On Claude Code versions before 2.1.275, run `/plugin marketplace add gccody/Love
 src/
   app.rs            event loop, Context, Game trait, run()
   conf.rs           Conf (window/startup options)
+  filesystem.rs     reading packaged files, the save directory
+  platform.rs       Android and iOS startup, android_main!
   graphics/
     mod.rs          Graphics: the immediate-mode drawing API + batching
     renderer.rs     frame recording structures and the wgpu backend
@@ -198,13 +277,14 @@ src/
   math.rs           Transform, RNG, noise, fast sin_cos
   timer.rs, window.rs
 examples/           runnable demos and games
+tools/cargo-love2drs/  packages games for Android and iOS
 skills/love2drs/    agent skill (SKILL.md + API reference + recipes)
 ```
 
 ## Roadmap ideas
 
-Android and iOS packaging, streaming playback for long music tracks, stencil support, multiple render
-targets, a retained `Text` object, a filesystem module that knows about the game's save directory, and
+Gamepads and the on-screen keyboard on mobile, store packaging, streaming playback for long music tracks,
+stencil support, multiple render targets, a retained `Text` object, a save directory on desktop, and
 WebAssembly support.
 
 ## License

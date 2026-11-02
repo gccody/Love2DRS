@@ -1,12 +1,13 @@
 //! Touchscreen state (the `love.touch` equivalent).
 //!
-//! Touch events come from touchscreens on Windows and Linux (X11 and Wayland).
-//! macOS has no touchscreens; trackpad gestures arrive as mouse and wheel
-//! events, so `ctx.touch` stays empty there.
+//! Touch events come from touchscreens on Android, iOS, Windows and Linux (X11
+//! and Wayland). macOS has no touchscreens; trackpad gestures arrive as mouse
+//! and wheel events, so `ctx.touch` stays empty there.
 //!
-//! Operating systems also turn the first finger into emulated mouse events for
-//! older programs, so a tap usually reaches both `touch_pressed` and
-//! `mouse_pressed`. Handle one or the other for the same action.
+//! The first finger also drives emulated mouse events for programs that only
+//! know about the mouse: the OS does this on desktop and love2drs on mobile. A
+//! tap therefore usually reaches both `touch_pressed` and `mouse_pressed`.
+//! Handle one or the other for the same action.
 
 use crate::math::Vec2;
 

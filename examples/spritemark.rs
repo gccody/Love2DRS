@@ -156,3 +156,5 @@ fn main() -> love2drs::Result {
         Spritemark::new,
     )
 }
+
+love2drs::android_main!(main);

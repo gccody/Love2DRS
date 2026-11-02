@@ -93,7 +93,7 @@ impl Font {
 
     /// Loads a TTF/OTF file.
     pub fn load(path: impl AsRef<Path>, size: f32) -> Result<Font> {
-        let bytes = std::fs::read(path.as_ref()).map_err(|e| Error::io(path.as_ref(), e))?;
+        let bytes = crate::filesystem::read(path)?;
         Self::from_bytes(bytes, size)
     }
 

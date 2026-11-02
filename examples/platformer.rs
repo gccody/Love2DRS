@@ -719,3 +719,5 @@ fn main() -> love2drs::Result {
         Platformer::new,
     )
 }
+
+love2drs::android_main!(main);

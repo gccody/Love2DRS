@@ -232,3 +232,5 @@ impl Game for Showcase {
 fn main() -> love2drs::Result {
     love2drs::run(Conf::new("love2drs showcase").msaa(4), Showcase::new)
 }
+
+love2drs::android_main!(main);

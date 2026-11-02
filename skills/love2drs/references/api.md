@@ -73,6 +73,9 @@ fn gamepad_axis(&mut self, ctx: &mut Context, id: GamepadId, axis: GamepadAxis, 
 fn resize(&mut self, ctx: &mut Context, width: f32, height: f32) // logical pixels
 fn focus(&mut self, ctx: &mut Context, focused: bool)
 fn file_dropped(&mut self, ctx: &mut Context, path: std::path::PathBuf)
+fn suspended(&mut self, ctx: &mut Context)    // Android/iOS: went to the background, so save now
+fn resumed(&mut self, ctx: &mut Context)      // Android/iOS: back from the background
+fn low_memory(&mut self, ctx: &mut Context)   // the OS wants memory back (love.lowmemory)
 fn quit(&mut self, ctx: &mut Context) -> bool                   // return true to cancel quitting
 ```
 
@@ -374,6 +377,7 @@ delta() -> f32   fps() -> f32   average_delta() -> f32   time() -> f64   frame_c
 title() set_title(impl Into<String>)  size() -> (f32, f32)  set_size(w: u32, h: u32)
 scale_factor() -> f64  set_fullscreen(bool) is_fullscreen()  set_resizable(bool)
 has_focus()  minimize()  is_minimized()  maximize()  winit() -> &winit::window::Window
+safe_area() -> (f32, f32, f32, f32)   // x, y, w, h clear of notches and system bars (love.window.getSafeArea)
 ```
 While minimized the game keeps running, capped at 30 fps.
 
@@ -398,6 +402,18 @@ SoundData::from_samples(sample_rate, channels, Vec<f32>)   // interleaved, -1..1
 SoundData::generate(sample_rate, seconds, |t_seconds| -> sample)   // mono synth
 d.channels() d.sample_rate() d.duration()
 ```
+
+## Filesystem (`love2drs::filesystem`)
+
+```text
+read(path) -> Result<Vec<u8>>   // from disk, then from the app package on Android/iOS
+save_dir() -> PathBuf           // where to save; the working directory on mobile
+```
+
+## Android (`love2drs::android_main!`)
+
+`love2drs::android_main!(main);` next to `fn main` makes it the entry point on Android. It expands to
+nothing on other platforms. `main` may return `()` or a `Result`.
 
 ## Math (`love2drs::math`)
 

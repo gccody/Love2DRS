@@ -43,6 +43,15 @@
 //! | `love.timer`     | [`ctx.timer`](timer::Timer)      |
 //! | `love.window`    | [`ctx.window`](window::Window)   |
 //! | `love.math`      | [`math`]                         |
+//! | `love.filesystem` | [`filesystem`]                  |
+//!
+//! ## Android and iOS
+//!
+//! Add [`android_main!`] next to `fn main`, then package and run the game with
+//! the `cargo-love2drs` tool. On a phone the window always fills the screen, so
+//! lay out from `ctx.graphics.width()` and `height()`, keep touch targets inside
+//! [`ctx.window.safe_area()`](window::Window::safe_area), load files through
+//! [`filesystem`], and save progress in [`Game::suspended`].
 //!
 //! ## Performance
 //!
@@ -58,9 +67,11 @@ mod app;
 pub mod audio;
 mod conf;
 mod error;
+pub mod filesystem;
 pub mod graphics;
 pub mod input;
 pub mod math;
+mod platform;
 pub mod timer;
 mod util;
 pub mod window;
@@ -68,6 +79,9 @@ pub mod window;
 pub use app::{Context, Game, run};
 pub use conf::Conf;
 pub use error::{Error, Result};
+#[cfg(target_os = "android")]
+#[doc(hidden)]
+pub use platform::{__android_entry, MainResult};
 
 /// Re-export of the GPU crate for advanced use.
 pub use wgpu;

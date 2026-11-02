@@ -135,7 +135,11 @@ enum StackEntry {
 /// The drawing API. Reach it through `ctx.graphics`.
 pub struct Graphics {
     gpu: Arc<Gpu>,
-    surface: wgpu::Surface<'static>,
+    instance: wgpu::Instance,
+    window: Arc<WinitWindow>,
+    /// `None` while the app is suspended: Android takes the native window away
+    /// then, and a surface can't outlive it.
+    surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     view_format: wgpu::TextureFormat,
     can_screenshot: bool,
@@ -207,7 +211,7 @@ impl Graphics {
         let info = adapter.get_info();
         log::info!("love2drs using {} ({:?})", info.name, info.backend);
 
-        let size = window.inner_size();
+        let size = crate::window::drawable_size(&window);
         let caps = surface.get_capabilities(&adapter);
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -248,7 +252,9 @@ impl Graphics {
         let font = Font::default_with_size(DEFAULT_FONT_SIZE);
         let mut g = Graphics {
             gpu,
-            surface,
+            instance,
+            window: window.clone(),
+            surface: Some(surface),
             config,
             view_format,
             can_screenshot,
@@ -343,8 +349,8 @@ impl Graphics {
 
         let mut surface_texture = None;
         let mut reconfigure = false;
-        if !self.minimized {
-            match self.surface.get_current_texture() {
+        if let Some(surface) = self.surface.as_ref().filter(|_| !self.minimized) {
+            match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t) => surface_texture = Some(t),
                 wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                     surface_texture = Some(t);
@@ -401,7 +407,7 @@ impl Graphics {
             self.gpu.queue.present(st);
         }
         if reconfigure {
-            self.surface.configure(&self.gpu.device, &self.config);
+            self.configure_surface();
         }
         self.frame_index += 1;
         self.reset_frame();
@@ -416,9 +422,34 @@ impl Graphics {
         if self.config.width != width || self.config.height != height {
             self.config.width = width;
             self.config.height = height;
-            self.surface.configure(&self.gpu.device, &self.config);
+            self.configure_surface();
             self.recreate_msaa();
         }
+    }
+
+    fn configure_surface(&self) {
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.gpu.device, &self.config);
+        }
+    }
+
+    /// Lets go of the window's surface while the app is in the background.
+    pub(crate) fn suspend(&mut self) {
+        self.surface = None;
+    }
+
+    /// Reconnects to the window when the app comes back. Images, canvases and
+    /// shaders survive, since only the surface was lost.
+    pub(crate) fn resume(&mut self) -> Result<()> {
+        let surface = self
+            .instance
+            .create_surface(self.window.clone())
+            .map_err(|e| Error::Graphics(e.to_string()))?;
+        self.surface = Some(surface);
+        let size = crate::window::drawable_size(&self.window);
+        self.resize(size.width, size.height, self.window.scale_factor());
+        self.configure_surface();
+        Ok(())
     }
 
     fn recreate_msaa(&mut self) {
@@ -470,7 +501,7 @@ impl Graphics {
     /// Enables or disables vertical sync.
     pub fn set_vsync(&mut self, vsync: bool) {
         self.config.present_mode = present_mode(vsync);
-        self.surface.configure(&self.gpu.device, &self.config);
+        self.configure_surface();
     }
 
     /// Rendering statistics for the previous frame.

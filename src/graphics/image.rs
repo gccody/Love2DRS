@@ -397,7 +397,7 @@ impl ImageData {
 
     /// Decodes an image file (PNG/JPEG depending on enabled features).
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let bytes = std::fs::read(path.as_ref()).map_err(|e| Error::io(path.as_ref(), e))?;
+        let bytes = crate::filesystem::read(path)?;
         Self::decode(&bytes)
     }
 

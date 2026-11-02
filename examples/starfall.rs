@@ -662,3 +662,5 @@ fn main() -> love2drs::Result {
         },
     )
 }
+
+love2drs::android_main!(main);

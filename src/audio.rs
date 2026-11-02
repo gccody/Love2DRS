@@ -59,7 +59,7 @@ impl SoundData {
 
     /// Decodes an audio file from disk.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let bytes = std::fs::read(path.as_ref()).map_err(|e| Error::io(path.as_ref(), e))?;
+        let bytes = crate::filesystem::read(path)?;
         Self::decode(bytes)
     }
 
@@ -108,6 +108,14 @@ struct Controls {
     seek: AtomicU64,
 }
 
+/// Set while the app is in the background on mobile, where the OS would
+/// otherwise let its sounds keep playing. Voices hold their position meanwhile.
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_suspended(suspended: bool) {
+    SUSPENDED.store(suspended, Ordering::Relaxed);
+}
+
 fn load_f32(a: &AtomicU32) -> f32 {
     f32::from_bits(a.load(Ordering::Relaxed))
 }
@@ -140,7 +148,7 @@ impl Voice {
             self.pos = seek as f64;
         }
         let channels = self.data.channels as usize;
-        if c.paused.load(Ordering::Relaxed) {
+        if c.paused.load(Ordering::Relaxed) || SUSPENDED.load(Ordering::Relaxed) {
             self.frame[..channels.min(8)].fill(0.0);
             return true;
         }

@@ -164,3 +164,5 @@ impl Game for Shaders {
 fn main() -> love2drs::Result {
     love2drs::run(Conf::new("love2drs shaders").size(900, 600), Shaders::new)
 }
+
+love2drs::android_main!(main);

@@ -217,6 +217,22 @@ thousands. Check `g.stats().draw_calls`.
 | `love.event.quit()` | `ctx.quit()` |
 | `conf.lua` | `Conf::new("title").size(w, h).resizable(true).vsync(true).msaa(4)` |
 
+## Android and iOS
+
+Put `love2drs::android_main!(main);` next to `fn main`, then use the `cargo-love2drs` tool:
+`cargo love2drs android run` or `cargo love2drs ios run` (iOS needs macOS). Add `--example <name>`,
+`--bin <name>` or `--release` as needed. App settings and the assets to package go under
+`[package.metadata.love2drs]` in `Cargo.toml`; see recipe 14.
+
+When a game should run on phones:
+
+- `Conf::size` is ignored because the window fills the screen. Never hard-code the layout: use
+  `ctx.graphics.width()`/`height()`, handle `resize`, and keep controls inside `ctx.window.safe_area()`.
+- Load files with love2drs loaders or `love2drs::filesystem::read`. `std::fs::read` can't see packaged assets.
+- Save in `Game::suspended`. The OS may end a backgrounded app without another callback.
+- Android's back gesture is `Key::Escape`, and the first finger also acts as the left mouse button.
+- Gamepads, rumble and the on-screen keyboard don't work on mobile yet.
+
 ## Verifying your work
 
 - Type-check quickly with `cargo check`. Run with `cargo run` (add `--release` for big scenes).
