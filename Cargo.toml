@@ -32,7 +32,12 @@ jpeg = ["image/jpeg"]
 
 [dependencies]
 wgpu = "30"
-winit = "0.30"
+# iOS 27 refuses apps built with its SDK unless they adopt the UIScene lifecycle, and no
+# winit release can run under it. This is 0.30.13 plus one commit that attaches new windows
+# to the connected scene. Return to crates.io once winit ships that (rust-windowing/winit#4224).
+# It has to be a git dependency: Cargo ignores `[patch]` in a dependency, so a patch wouldn't
+# reach games. Keep the Android entry below on the same rev, so only one winit gets built.
+winit = { git = "https://github.com/molenick/winit", rev = "94d6a23c425023810a0879aa7a03abb2e4f1decc" }
 glam = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
@@ -51,7 +56,7 @@ hidapi = { version = "2.6", default-features = false, features = ["windows-nativ
 
 # NativeActivity needs no Java, so an APK can be packaged without Gradle.
 [target.'cfg(target_os = "android")'.dependencies]
-winit = { version = "0.30", features = ["android-native-activity"] }
+winit = { git = "https://github.com/molenick/winit", rev = "94d6a23c425023810a0879aa7a03abb2e4f1decc", features = ["android-native-activity"] }
 android_logger = "0.15"
 jni = "0.21"
 
