@@ -131,7 +131,10 @@ impl Window {
             let view: &AnyObject = handle.ui_view.cast::<AnyObject>().as_ref();
             let division: *mut AnyObject = msg_send![kinds, divisionRegionKind];
             let occlusion: *mut AnyObject = msg_send![kinds, occlusionRegionKind];
-            for (ios_kind, kind) in [(division, ReservedKind::Division), (occlusion, ReservedKind::Occlusion)] {
+            for (ios_kind, kind) in [
+                (division, ReservedKind::Division),
+                (occlusion, ReservedKind::Occlusion),
+            ] {
                 let found: *mut AnyObject = msg_send![view, reservedRegionsOfKind: ios_kind];
                 let count: usize = msg_send![found, count];
                 for i in 0..count {

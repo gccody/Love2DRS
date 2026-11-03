@@ -326,89 +326,124 @@ mod imp {
     /// rumble commands; bounds rumble latency and timing error.
     const POLL_MS: i32 = 4;
 
-    /// The hidapi context.
+    /// A scan's request: the paths already open, and where to send what it finds.
+    type Scan = (Vec<CString>, Sender<Vec<Pad>>);
+
+    /// The hidapi context, on a thread of its own. Listing devices spins the
+    /// calling thread's run loop on macOS, which runs whatever else is queued
+    /// there. On the main thread that re-enters winit's event handler, which panics.
     pub(crate) struct Hid {
-        api: Option<HidApi>,
+        scans: Option<Sender<Scan>>,
     }
 
     impl Hid {
         pub(crate) fn new() -> Self {
-            let api = HidApi::new()
-                .map_err(|e| {
-                    log::warn!("hidapi unavailable, PlayStation pads fall back to gilrs: {e}")
-                })
-                .ok();
-            Hid { api }
+            let (scans, requests) = mpsc::channel::<Scan>();
+            let (ready, started) = mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("hidapi".to_owned())
+                .spawn(move || {
+                    let mut api = match HidApi::new() {
+                        Ok(api) => api,
+                        Err(e) => {
+                            log::warn!(
+                                "hidapi unavailable, PlayStation pads fall back to gilrs: {e}"
+                            );
+                            let _ = ready.send(false);
+                            return;
+                        }
+                    };
+                    let _ = ready.send(true);
+                    for (open, reply) in requests {
+                        let _ = reply.send(open_new_pads(&mut api, &open));
+                    }
+                });
+            let available = thread.is_ok() && started.recv().unwrap_or(false);
+            Hid {
+                scans: available.then_some(scans),
+            }
         }
 
         /// A backend that finds nothing, for tests.
         #[cfg(test)]
         pub(crate) fn disabled() -> Self {
-            Hid { api: None }
+            Hid { scans: None }
         }
 
         /// Whether PlayStation pads are read here rather than through gilrs.
         pub(crate) fn available(&self) -> bool {
-            self.api.is_some()
+            self.scans.is_some()
         }
 
         /// Opens every supported controller that isn't in `open` yet.
         pub(crate) fn scan(&mut self, open: &[&CStr]) -> Vec<Pad> {
-            let Some(api) = &mut self.api else {
+            let Some(scans) = &self.scans else {
                 return Vec::new();
             };
-            if let Err(e) = api
-                .reset_devices()
-                .and_then(|()| api.add_devices(SONY_VID, 0))
-            {
-                log::warn!("couldn't list HID devices: {e}");
+            let open = open.iter().map(|path| (*path).to_owned()).collect();
+            let (reply, found) = mpsc::channel();
+            if scans.send((open, reply)).is_err() {
                 return Vec::new();
             }
-            let mut found: Vec<Pad> = Vec::new();
-            for info in api.device_list() {
-                let (vid, pid) = (info.vendor_id(), info.product_id());
-                // Skip non-gamepad collections (usage page 1 is Generic
-                // Desktop; 0 means the backend didn't say).
-                if !is_supported(vid, pid) || !matches!(info.usage_page(), 0 | 1) {
-                    continue;
-                }
-                let path = info.path();
-                if open.contains(&path) || found.iter().any(|p| p.path.as_c_str() == path) {
-                    continue;
-                }
-                let dev = match api.open_path(path) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::warn!("couldn't open PlayStation controller: {e}");
-                        continue;
-                    }
-                };
-                let bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
-                let (kind, name) = match pid {
-                    DUALSENSE_PID => (
-                        Kind::DualSense {
-                            v2: dualsense_has_vibration_v2(&dev),
-                        },
-                        "DualSense",
-                    ),
-                    DUALSENSE_EDGE_PID => (Kind::DualSense { v2: true }, "DualSense Edge"),
-                    _ => (Kind::DualShock4, "DualShock 4"),
-                };
-                log::debug!(
-                    "{name} via HID ({})",
-                    if bluetooth { "Bluetooth" } else { "USB" }
-                );
-                found.push(Pad::spawn(
-                    dev,
-                    path.to_owned(),
-                    name,
-                    (vid, pid),
-                    kind,
-                    bluetooth,
-                ));
-            }
-            found
+            found.recv().unwrap_or_default()
         }
+    }
+
+    /// What a scan does on the hidapi thread.
+    fn open_new_pads(api: &mut HidApi, open: &[CString]) -> Vec<Pad> {
+        if let Err(e) = api
+            .reset_devices()
+            .and_then(|()| api.add_devices(SONY_VID, 0))
+        {
+            log::warn!("couldn't list HID devices: {e}");
+            return Vec::new();
+        }
+        let mut found: Vec<Pad> = Vec::new();
+        for info in api.device_list() {
+            let (vid, pid) = (info.vendor_id(), info.product_id());
+            // Skip non-gamepad collections (usage page 1 is Generic
+            // Desktop; 0 means the backend didn't say).
+            if !is_supported(vid, pid) || !matches!(info.usage_page(), 0 | 1) {
+                continue;
+            }
+            let path = info.path();
+            if open.iter().any(|o| o.as_c_str() == path)
+                || found.iter().any(|p| p.path.as_c_str() == path)
+            {
+                continue;
+            }
+            let dev = match api.open_path(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("couldn't open PlayStation controller: {e}");
+                    continue;
+                }
+            };
+            let bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
+            let (kind, name) = match pid {
+                DUALSENSE_PID => (
+                    Kind::DualSense {
+                        v2: dualsense_has_vibration_v2(&dev),
+                    },
+                    "DualSense",
+                ),
+                DUALSENSE_EDGE_PID => (Kind::DualSense { v2: true }, "DualSense Edge"),
+                _ => (Kind::DualShock4, "DualShock 4"),
+            };
+            log::debug!(
+                "{name} via HID ({})",
+                if bluetooth { "Bluetooth" } else { "USB" }
+            );
+            found.push(Pad::spawn(
+                dev,
+                path.to_owned(),
+                name,
+                (vid, pid),
+                kind,
+                bluetooth,
+            ));
+        }
+        found
     }
 
     /// Reads the DualSense firmware version: v2 rumble arrived in update 2.21.
@@ -631,6 +666,16 @@ mod stub {
 mod tests {
     use super::*;
     use GamepadButton as B;
+
+    /// Hid's thread answers scans whether or not hidapi could start, and stops with it.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn scans_are_answered_off_the_calling_thread() {
+        let mut hid = Hid::new();
+        let _ = hid.scan(&[]);
+        let _ = hid.scan(&[]);
+        assert!(!Hid::disabled().available());
+    }
 
     fn pressed(input: &Input) -> Vec<GamepadButton> {
         GamepadButton::ALL
