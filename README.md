@@ -203,6 +203,8 @@ privacy_manifest = "ios/PrivacyInfo.xcprivacy"  # iOS; default: made for you, se
   and `height()`, handle `Game::resize` for rotation, and keep controls inside `ctx.window.safe_area()`,
   away from notches and gesture bars. Most of the bundled examples use fixed desktop layouts and get
   clipped on a phone; `examples/mobile.rs` is the one written for it.
+- **A foldable can have a fold in the way.** While iPhone Duo is partly open, `ctx.window.reserved_regions()`
+  says where the fold runs, so controls can sit on either side of it.
 - **Touch is the main input.** The first finger also acts as the left mouse button, so mouse-only games
   work, and Android's back gesture arrives as `Key::Escape`.
 - **The OS can take a touch away**, for a back gesture, a call or the notification shade, and losing focus does the
