@@ -383,6 +383,7 @@ title() set_title(impl Into<String>)  size() -> (f32, f32)  set_size(w: u32, h: 
 scale_factor() -> f64  set_fullscreen(bool) is_fullscreen()  set_resizable(bool)
 has_focus()  minimize()  is_minimized()  maximize()  winit() -> &winit::window::Window
 safe_area() -> (f32, f32, f32, f32)   // x, y, w, h clear of notches, system bars and the on-screen keyboard (love.window.getSafeArea)
+reserved_regions() -> Vec<ReservedRegion>   // a foldable's fold and cameras right now: kind (Division | Occlusion), x, y, width, height. iOS 27.1+, empty elsewhere
 ```
 While minimized the game keeps running, capped at 30 fps.
 

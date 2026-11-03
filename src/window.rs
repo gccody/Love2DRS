@@ -14,6 +14,31 @@ pub(crate) fn drawable_size(window: &WinitWindow) -> winit::dpi::PhysicalSize<u3
     }
 }
 
+/// What takes a [`ReservedRegion`] out of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedKind {
+    /// A fold: content should sit on either side of it.
+    Division,
+    /// Hardware such as a camera covering the window.
+    Occlusion,
+}
+
+/// A part of the window that a foldable's hardware has reserved.
+/// See [`Window::reserved_regions`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReservedRegion {
+    /// What reserved it.
+    pub kind: ReservedKind,
+    /// Left edge, in logical pixels from the window's left.
+    pub x: f32,
+    /// Top edge, in logical pixels from the window's top.
+    pub y: f32,
+    /// Width in logical pixels.
+    pub width: f32,
+    /// Height in logical pixels.
+    pub height: f32,
+}
+
 /// The game window. Reach it through `ctx.window`.
 pub struct Window {
     pub(crate) inner: Arc<WinitWindow>,
@@ -69,6 +94,60 @@ impl Window {
         let _ = scale;
         let (w, h) = self.size();
         (0.0, 0.0, w, h)
+    }
+
+    /// What a foldable's fold and cameras take out of the window right now, in
+    /// logical pixels. A fold shows up only while the device is partly open, and a
+    /// camera only while it covers the window. The frames include the margins the OS
+    /// asks interactive content to keep. Empty everywhere but iOS 27.1 and up.
+    pub fn reserved_regions(&self) -> Vec<ReservedRegion> {
+        #[cfg(target_os = "ios")]
+        return self.ios_reserved_regions();
+        #[cfg(not(target_os = "ios"))]
+        Vec::new()
+    }
+
+    #[cfg(target_os = "ios")]
+    fn ios_reserved_regions(&self) -> Vec<ReservedRegion> {
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2::{msg_send, rc::autoreleasepool};
+        use objc2_foundation::NSRect;
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Ok(handle) = self.inner.window_handle() else {
+            return Vec::new();
+        };
+        let RawWindowHandle::UiKit(handle) = handle.as_raw() else {
+            return Vec::new();
+        };
+        // The class is missing before iOS 27.1, which is how older systems opt out.
+        let Some(kinds) = AnyClass::get(c"UIViewReservedRegionKind") else {
+            return Vec::new();
+        };
+        let mut regions = Vec::new();
+        // SAFETY: the handle's view lives as long as the window, and these messages
+        // exist wherever the class above does.
+        autoreleasepool(|_| unsafe {
+            let view: &AnyObject = handle.ui_view.cast::<AnyObject>().as_ref();
+            let division: *mut AnyObject = msg_send![kinds, divisionRegionKind];
+            let occlusion: *mut AnyObject = msg_send![kinds, occlusionRegionKind];
+            for (ios_kind, kind) in [(division, ReservedKind::Division), (occlusion, ReservedKind::Occlusion)] {
+                let found: *mut AnyObject = msg_send![view, reservedRegionsOfKind: ios_kind];
+                let count: usize = msg_send![found, count];
+                for i in 0..count {
+                    let region: *mut AnyObject = msg_send![found, objectAtIndex: i];
+                    let frame: NSRect = msg_send![region, frame];
+                    regions.push(ReservedRegion {
+                        kind,
+                        x: frame.origin.x as f32,
+                        y: frame.origin.y as f32,
+                        width: frame.size.width as f32,
+                        height: frame.size.height as f32,
+                    });
+                }
+            }
+        });
+        regions
     }
 
     /// The top of the on-screen keyboard's area, in logical pixels from the top of
