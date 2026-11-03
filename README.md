@@ -172,6 +172,12 @@ lists every option. Apps are written to `target/love2drs/`.
 - **iOS**, on macOS only: Xcode, and `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`.
   iOS 15 or newer. To install on a real device, pass `--device <UDID> --identity <NAME> --profile <PATH>`
   with a signing identity and provisioning profile from your Apple developer account.
+  iOS 27 stops apps built with its SDK at launch unless they adopt the UIScene lifecycle. love2drs handles this, and
+  `cargo-love2drs` declares it in `Info.plist`, so if an older game crashes as soon as it opens, run
+  `cargo update -p love2drs` and reinstall `cargo-love2drs`. Both are needed. If you write your own `Info.plist`, its
+  `UIApplicationSceneManifest` has to list a configuration under `UISceneConfigurations`.
+  love2drs uses a [winit fork](https://github.com/molenick/winit/tree/uiscene-minimal-v0.30) for this until winit
+  supports UIScene, so use `love2drs::winit` instead of adding your own `winit` dependency.
 
 **App settings** go in your game's `Cargo.toml`. All of them are optional:
 

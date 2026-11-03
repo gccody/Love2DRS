@@ -42,6 +42,59 @@ macro_rules! android_main {
     };
 }
 
+#[cfg(target_os = "ios")]
+pub(crate) use ios::SceneWindow;
+
+#[cfg(target_os = "ios")]
+mod ios {
+    use objc2::rc::{Allocated, Retained};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    /// A window that's key only while winit makes the real one.
+    ///
+    /// winit makes its window with `initWithFrame:` and then attaches it to the
+    /// scene. Under the UIScene lifecycle, UIKit then leaves that window's safe area
+    /// as it was in the first orientation, so landscape gets portrait's insets. That
+    /// doesn't happen if a window made with `initWithWindowScene:` was key first.
+    /// This can go once winit makes its window from the scene.
+    pub(crate) struct SceneWindow(Retained<AnyObject>);
+
+    impl SceneWindow {
+        /// `None` if no window scene is connected. Call on the main thread.
+        pub(crate) fn show() -> Option<Self> {
+            // SAFETY: The event loop calls this on the main thread, and these are
+            // UIKit's documented signatures for iOS 13 and up.
+            unsafe {
+                let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+                let scenes: *mut AnyObject = msg_send![app, connectedScenes];
+                let scenes: *mut AnyObject = msg_send![scenes, allObjects];
+                let count: usize = msg_send![scenes, count];
+                let scene = (0..count)
+                    .map(|i| -> *mut AnyObject { msg_send![scenes, objectAtIndex: i] })
+                    .find(|&scene| {
+                        let is_window_scene: bool =
+                            msg_send![scene, isKindOfClass: class!(UIWindowScene)];
+                        is_window_scene
+                    })?;
+                let window: Allocated<AnyObject> = msg_send![class!(UIWindow), alloc];
+                let window: Retained<AnyObject> = msg_send![window, initWithWindowScene: scene];
+                let controller: Retained<AnyObject> = msg_send![class!(UIViewController), new];
+                let _: () = msg_send![&*window, setRootViewController: &*controller];
+                let _: () = msg_send![&*window, makeKeyAndVisible];
+                Some(SceneWindow(window))
+            }
+        }
+    }
+
+    impl Drop for SceneWindow {
+        fn drop(&mut self) {
+            // SAFETY: Made on the main thread and dropped in the same event.
+            let _: () = unsafe { msg_send![&*self.0, setHidden: true] };
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 pub use android::{__android_entry, MainResult};
 #[cfg(target_os = "android")]

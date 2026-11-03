@@ -383,11 +383,15 @@ where
         if conf.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
+        #[cfg(target_os = "ios")]
+        let scene_window = crate::platform::SceneWindow::show();
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .map_err(|e| Error::Window(e.to_string()))?,
         );
+        #[cfg(target_os = "ios")]
+        drop(scene_window);
         let graphics = Graphics::new(window.clone(), event_loop.owned_display_handle(), conf)?;
         let mut ctx = Context {
             graphics,

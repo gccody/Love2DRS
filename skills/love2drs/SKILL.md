@@ -238,6 +238,9 @@ When a game should run on phones:
 - Sound stops while the app is in the background or paused and carries on by itself afterwards. On iOS it mixes
   with the player's music by default, and `ctx.audio.set_session(AudioSession::Playback)` changes that.
 - On Android, Vulkan is used if the device has a driver and OpenGL ES 3 otherwise.
+- If an iOS game crashes as soon as it opens on iOS 27, its `love2drs` or `cargo-love2drs` predates UIScene support.
+  Run `cargo update -p love2drs` and reinstall `cargo-love2drs`. love2drs uses a winit fork for this, so use
+  `love2drs::winit` instead of adding a separate `winit` dependency.
 - `ctx.gamepad` and rumble work as on desktop. Check `is_vibration_supported()` before relying on rumble.
 - `ctx.keyboard.set_screen_keyboard(true)` opens the on-screen keyboard. Read typing from `text_input`, and
   `Key::Backspace` and `Key::Enter` from `key_pressed`. `safe_area()` shrinks while it's up, and the user can
