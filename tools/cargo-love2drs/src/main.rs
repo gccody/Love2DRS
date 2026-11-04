@@ -63,7 +63,7 @@ for the app itself live in the game's Cargo.toml:
     permissions = [\"android.permission.INTERNET\"]  # Android
     android_dependencies = [\"group:name:1.0\"]      # Android; Java libraries, built with Gradle
     android_meta_data = { \"key\" = \"value\" }      # Android; settings those libraries read
-    app_category = \"game\"            # Android; the default, and without it Android
+    app_category = \"game\"            # the default. Game Mode on iOS; without it Android
                                      # 16 tablets ignore orientation. \"none\" leaves
                                      # it out; others are in Android's manifest docs
     ios_deployment_target = \"15.0\"   # iOS

@@ -816,6 +816,7 @@ Mouse-only games do the same with `mouse_cancelled`.
 ```toml
 [package.metadata.love2drs]
 app_category = "game"     # the default; keeps a locked orientation working on Android 16 tablets
+# On iOS, "game" also writes the keys that make the app eligible for Game Mode. "none" leaves it all out.
 privacy_manifest = "ios/PrivacyInfo.xcprivacy"  # needed if the game collects data, see below
 ```
 

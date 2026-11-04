@@ -528,6 +528,26 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     let code = project.version_code;
     let min_os = xml_escape(&project.ios_deployment_target);
     let build_info = build_info.map(BuildInfo::plist_entries).unwrap_or_default();
+    // The App Store refuses a 64-bit binary that doesn't list `arm64` here (error 90502).
+    // Simulators can run on an Intel Mac, so only a real device's build says so.
+    let arm64 = if physical {
+        "        <string>arm64</string>\n"
+    } else {
+        ""
+    };
+    // Eligibility, not a switch: the OS decides when Game Mode runs. Apple's sessions name
+    // both keys and don't say how they differ on iOS, so a game gets both.
+    let game_mode = if project.app_category.as_deref() == Some("game") {
+        "    <key>GCSupportsGameMode</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <key>LSSupportsGameMode</key>
+    <true/>
+"
+    } else {
+        ""
+    };
     // An empty `UILaunchScreen` is what asks for the whole screen. Without one,
     // iOS runs the app letterboxed at an old iPhone's resolution.
     //
@@ -572,7 +592,7 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     </array>
     <key>GCSupportsControllerUserInteraction</key>
     <true/>
-    <key>LSRequiresIPhoneOS</key>
+{game_mode}    <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
     <string>{min_os}</string>
@@ -600,7 +620,7 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
     <dict/>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
-        <string>metal</string>
+{arm64}        <string>metal</string>
     </array>
     <key>UIRequiresFullScreen</key>
     <true/>
@@ -822,6 +842,27 @@ mod tests {
             assert!(plist.contains(expected), "missing {expected}");
         }
         assert!(!info_plist(&project(Orientation::Any), true, None).contains("DTSDKName"));
+    }
+
+    #[test]
+    fn games_ask_for_game_mode() {
+        let plist = info_plist(&project(Orientation::Any), true, None);
+        for key in ["GCSupportsGameMode", "LSSupportsGameMode"] {
+            assert!(plist.contains(&format!("<key>{key}</key>\n    <true/>")), "{key}");
+        }
+        assert!(plist.contains("<string>public.app-category.games</string>"));
+
+        let mut other = project(Orientation::Any);
+        other.app_category = None;
+        let plist = info_plist(&other, true, None);
+        assert!(!plist.contains("GameMode"));
+        assert!(!plist.contains("LSApplicationCategoryType"));
+    }
+
+    #[test]
+    fn real_devices_require_arm64() {
+        assert!(info_plist(&project(Orientation::Any), true, None).contains("<string>arm64</string>"));
+        assert!(!info_plist(&project(Orientation::Any), false, None).contains("<string>arm64</string>"));
     }
 
     #[test]

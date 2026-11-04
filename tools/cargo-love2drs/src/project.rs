@@ -325,7 +325,8 @@ fn parse_orientation(value: Option<&str>) -> Result<Orientation, String> {
 }
 
 /// `android:appCategory`. Games are the default here because Android 16 ignores
-/// a locked orientation on tablets unless the app says it's a game.
+/// a locked orientation on tablets unless the app says it's a game. On iOS, `game`
+/// also writes the keys that make the app eligible for Game Mode.
 fn parse_app_category(value: Option<&str>) -> Result<Option<String>, String> {
     const CATEGORIES: [&str; 9] = [
         "accessibility",
