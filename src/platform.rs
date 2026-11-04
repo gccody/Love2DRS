@@ -96,9 +96,9 @@ mod ios {
 }
 
 #[cfg(target_os = "android")]
-pub use android::{__android_entry, MainResult};
+pub use android::{__android_entry, MainResult, android_app};
 #[cfg(target_os = "android")]
-pub(crate) use android::{android_app, window_insets};
+pub(crate) use android::window_insets;
 #[cfg(all(target_os = "android", feature = "gamepad"))]
 pub(crate) use android::{sdk_version, with_jni};
 
@@ -119,7 +119,14 @@ mod android {
     /// exits. Android restarts a foreground app whose process just disappears.
     const FINISH_GRACE: Duration = Duration::from_millis(500);
 
-    pub(crate) fn android_app() -> &'static AndroidApp {
+    /// The running app, for reaching Android's APIs the framework doesn't wrap.
+    /// `activity_as_ptr()` is the real `Activity`, and `vm_as_ptr()` the Java VM.
+    /// There's only ever one activity, since a second one restarts the process.
+    ///
+    /// # Panics
+    ///
+    /// Without `love2drs::android_main!`, which sets it before `main` runs.
+    pub fn android_app() -> &'static AndroidApp {
         APP.get().expect("love2drs::android_main! sets the app")
     }
 

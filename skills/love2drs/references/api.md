@@ -431,6 +431,12 @@ save_dir() -> PathBuf           // where to save; the working directory on mobil
 `love2drs::android_main!(main);` next to `fn main` makes it the entry point on Android. It expands to
 nothing on other platforms. `main` may return `()` or a `Result`.
 
+`love2drs::android_app()` is the running `AndroidApp` (from `android-activity`, re-exported through
+`love2drs::winit::platform::android::activity`), for Android APIs the framework doesn't wrap. Its
+`activity_as_ptr()` is the real `Activity` and `vm_as_ptr()` the Java VM. Android only, and it panics without
+`android_main!`. Use it rather than `ndk_context::android_context()`: that holds the `Application`, and passing
+one where JNI declares an `Activity` aborts the process.
+
 ## Math (`love2drs::math`)
 
 ```rust

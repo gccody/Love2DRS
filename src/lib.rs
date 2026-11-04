@@ -84,6 +84,8 @@ pub use error::{Error, Result};
 #[cfg(target_os = "android")]
 #[doc(hidden)]
 pub use platform::{__android_entry, MainResult};
+#[cfg(target_os = "android")]
+pub use platform::android_app;
 
 /// Re-export of the GPU crate for advanced use.
 pub use wgpu;
