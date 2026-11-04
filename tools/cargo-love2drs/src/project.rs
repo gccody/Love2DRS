@@ -61,6 +61,11 @@ pub struct Project {
     pub min_sdk: u64,
     pub target_sdk: u64,
     pub permissions: Vec<String>,
+    /// Maven packages with Java the game calls through JNI, like
+    /// `com.google.android.gms:play-services-games-v2:22.1.0`. Needs Gradle.
+    pub android_dependencies: Vec<String>,
+    /// `<meta-data>` for the application, for those libraries to read.
+    pub android_meta_data: Vec<(String, String)>,
     /// What Android files the app under, or `None` to leave it out of the manifest.
     pub app_category: Option<String>,
     pub ios_deployment_target: String,
@@ -115,6 +120,18 @@ impl Project {
             check_assets(&root, std::slice::from_ref(manifest))?;
         }
 
+        let android_dependencies: Vec<String> = settings["android_dependencies"]
+            .as_array()
+            .map(|list| list.iter().map(text).collect())
+            .unwrap_or_default();
+        let android_meta_data: Vec<(String, String)> = settings["android_meta_data"]
+            .as_object()
+            .map(|table| table.iter().map(|(k, v)| (k.clone(), text(v))).collect())
+            .unwrap_or_default();
+        if android_dependencies.is_empty() && !android_meta_data.is_empty() {
+            return Err("android_meta_data is for the libraries in android_dependencies, and there are none".into());
+        }
+
         let version = text(&package["version"]);
         let app_id = match settings["app_id"].as_str() {
             // Examples share the package's settings but are separate apps.
@@ -146,6 +163,8 @@ impl Project {
                 .as_array()
                 .map(|list| list.iter().map(text).collect())
                 .unwrap_or_default(),
+            android_dependencies,
+            android_meta_data,
             app_category: parse_app_category(settings["app_category"].as_str())?,
             ios_deployment_target: settings["ios_deployment_target"]
                 .as_str()

@@ -8,6 +8,9 @@
 //! An app bundle for Google Play starts the same way, with `aapt2` writing the
 //! protobuf format bundles use. Its files are then rearranged into a module for
 //! `bundletool`, and `jarsigner` signs the result.
+//!
+//! A game that lists `android_dependencies` is the exception: Gradle makes the
+//! part `aapt2 link` otherwise would (see `gradle.rs`), and the rest is the same.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -16,6 +19,7 @@ use std::process::{Command, Stdio};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::gradle;
 use crate::project::{self, Orientation, Project, capture, run, xml_escape};
 use crate::{Action, Options};
 
@@ -256,8 +260,13 @@ fn prepare(
     }
 
     let manifest = work.join("AndroidManifest.xml");
-    let manifest_text =
-        android_manifest(project, &lib_name, !options.release, project.icon.is_some());
+    let manifest_text = android_manifest(
+        project,
+        &lib_name,
+        !options.release,
+        project.icon.is_some(),
+        false,
+    );
     std::fs::write(&manifest, manifest_text).map_err(|e| format!("{}: {e}", manifest.display()))?;
     Ok(Prepared {
         work,
@@ -301,6 +310,38 @@ fn link(
     run(&mut aapt2, "")
 }
 
+/// The APK from Gradle for a game with Java libraries (see `gradle.rs`).
+fn gradle_base(
+    project: &Project,
+    options: &Options,
+    sdk: &Sdk,
+    prepared: &Prepared,
+) -> Result<PathBuf, String> {
+    let icon_res = match &project.icon {
+        Some(icon) => {
+            let res = prepared.work.join("res");
+            write_icon_resources(&project.root.join(icon), &res)?;
+            Some(res)
+        }
+        None => None,
+    };
+    let lib_name = project.name.replace('-', "_");
+    gradle::base_apk(&gradle::Input {
+        project,
+        sdk_root: &sdk.root,
+        dir: prepared.work.join("gradle"),
+        manifest: android_manifest(
+            project,
+            &lib_name,
+            !options.release,
+            project.icon.is_some(),
+            true,
+        ),
+        debuggable: !options.release,
+        icon_res,
+    })
+}
+
 fn build_apk(
     project: &Project,
     options: &Options,
@@ -309,8 +350,13 @@ fn build_apk(
 ) -> Result<PathBuf, String> {
     let prepared = prepare(project, options, sdk, abis)?;
     let work = &prepared.work;
-    let base = work.join("base.apk");
-    link(project, options, sdk, &prepared, &base, false)?;
+    let base = if project.android_dependencies.is_empty() {
+        let base = work.join("base.apk");
+        link(project, options, sdk, &prepared, &base, false)?;
+        base
+    } else {
+        gradle_base(project, options, sdk, &prepared)?
+    };
 
     let unaligned = work.join("unaligned.apk");
     add_files(&base, &unaligned, &prepared.libs, &project.asset_files()?)?;
@@ -351,7 +397,18 @@ fn build_bundle(
     let work = &prepared.work;
 
     let linked = work.join("bundle-linked.apk");
-    link(project, options, sdk, &prepared, &linked, true)?;
+    if project.android_dependencies.is_empty() {
+        link(project, options, sdk, &prepared, &linked, true)?;
+    } else {
+        let base = gradle_base(project, options, sdk, &prepared)?;
+        run(
+            Command::new(sdk.tool("aapt2"))
+                .args(["convert", "--output-format", "proto", "-o"])
+                .arg(&linked)
+                .arg(&base),
+            "",
+        )?;
+    }
     let module = work.join("bundle-base.zip");
     write_bundle_module(&linked, &module, &prepared.libs, &project.asset_files()?)?;
 
@@ -410,10 +467,16 @@ fn metadata_flag(abi: &str, library: &str, symbols: &Path) -> String {
 
 /// Where a file from `aapt2 --proto-format` goes in a bundle module.
 fn bundle_module_path(name: &str) -> String {
+    let dex = name.starts_with("classes") && name.ends_with(".dex");
     if name == "AndroidManifest.xml" {
         format!("manifest/{name}")
-    } else {
+    } else if dex {
+        format!("dex/{name}")
+    } else if name == "resources.pb" || name.starts_with("res/") {
         name.to_string()
+    } else {
+        // What libraries bring along for themselves, which the app reads as resources.
+        format!("root/{name}")
     }
 }
 
@@ -602,7 +665,15 @@ fn retarget_game_crate(args: &mut [String], game: &str) -> Option<(PathBuf, Path
     ))
 }
 
-fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_icon: bool) -> String {
+/// The manifest. For Gradle (`for_gradle`), the id and debuggable setting are in the
+/// build file instead, there's code, and libraries can find their settings here.
+fn android_manifest(
+    project: &Project,
+    lib_name: &str,
+    debuggable: bool,
+    has_icon: bool,
+    for_gradle: bool,
+) -> String {
     let orientation = match project.orientation {
         // The `user` variants respect the rotation lock.
         Orientation::Any => "fullUser",
@@ -619,7 +690,30 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_ico
             )
         })
         .collect();
-    let package = xml_escape(&project.android_id());
+    let package = if for_gradle {
+        String::new()
+    } else {
+        format!(" package=\"{}\"", xml_escape(&project.android_id()))
+    };
+    let code = if for_gradle {
+        "\n        android:hasCode=\"true\"".to_string()
+    } else {
+        format!(
+            "\n        android:hasCode=\"false\"\n        android:debuggable=\"{debuggable}\""
+        )
+    };
+    let meta_data: String = project
+        .android_meta_data
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            format!(
+                "        <meta-data android:name=\"{}\" android:value=\"@string/{}\" />\n",
+                xml_escape(name),
+                gradle::meta_data_resource(i)
+            )
+        })
+        .collect();
     let label = xml_escape(&project.display_name);
     let category = project
         .app_category
@@ -641,16 +735,14 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_ico
     // phones without it run on OpenGL ES instead.
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package}">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"{package}>
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 {permissions}    <application
-        android:label="{label}"{icon}{category}
-        android:hasCode="false"
-        android:debuggable="{debuggable}"
+        android:label="{label}"{icon}{category}{code}
         android:extractNativeLibs="false"
         android:enableOnBackInvokedCallback="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
-        <activity
+{meta_data}        <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
             android:launchMode="singleTask"
@@ -672,8 +764,24 @@ fn android_manifest(project: &Project, lib_name: &str, debuggable: bool, has_ico
 /// them. Returns the file `aapt2 link` takes.
 fn compile_icon(sdk: &Sdk, icon: &Path, work: &Path) -> Result<PathBuf, String> {
     let res = work.join("res");
+    write_icon_resources(icon, &res)?;
+    let compiled = work.join("res.zip");
+    run(
+        Command::new(sdk.tool("aapt2"))
+            .arg("compile")
+            .arg("--dir")
+            .arg(&res)
+            .arg("-o")
+            .arg(&compiled),
+        "",
+    )?;
+    Ok(compiled)
+}
+
+/// Writes the launcher icon at every density as Android resources in `res`.
+fn write_icon_resources(icon: &Path, res: &Path) -> Result<(), String> {
     if res.exists() {
-        std::fs::remove_dir_all(&res).map_err(|e| format!("{}: {e}", res.display()))?;
+        std::fs::remove_dir_all(res).map_err(|e| format!("{}: {e}", res.display()))?;
     }
     let source = crate::icon::load(icon)?;
     let write = |dir: &str, name: &str, image: &image::RgbaImage| {
@@ -718,19 +826,7 @@ fn compile_icon(sdk: &Sdk, icon: &Path, work: &Path) -> Result<PathBuf, String> 
          <foreground android:drawable=\"@mipmap/ic_launcher_foreground\" />\n\
          </adaptive-icon>\n",
     )
-    .map_err(|e| format!("can't write the icon: {e}"))?;
-
-    let compiled = work.join("res.zip");
-    run(
-        Command::new(sdk.tool("aapt2"))
-            .arg("compile")
-            .arg("--dir")
-            .arg(&res)
-            .arg("-o")
-            .arg(&compiled),
-        "",
-    )?;
-    Ok(compiled)
+    .map_err(|e| format!("can't write the icon: {e}"))
 }
 
 /// Copies the APK from `aapt2` and adds native libraries and assets to it.
@@ -1003,12 +1099,14 @@ mod tests {
             app_category: Some("game".into()),
             ios_deployment_target: "15.0".into(),
             privacy_manifest: None,
+            android_dependencies: vec![],
+            android_meta_data: vec![],
         }
     }
 
     #[test]
     fn manifest_fills_in_the_project() {
-        let xml = android_manifest(&project(), "my_game", true, true);
+        let xml = android_manifest(&project(), "my_game", true, true, false);
         assert!(xml.contains(r#"android:icon="@mipmap/ic_launcher""#));
         assert!(xml.contains("android.permission.VIBRATE"));
         assert!(xml.contains(r#"package="com.example.my_game""#));
@@ -1022,11 +1120,38 @@ mod tests {
     #[test]
     fn manifest_declares_the_category_if_there_is_one() {
         let mut p = project();
-        let xml = android_manifest(&p, "my_game", false, false);
+        let xml = android_manifest(&p, "my_game", false, false, false);
         assert!(xml.contains(r#"android:appCategory="game""#));
         p.app_category = None;
-        let xml = android_manifest(&p, "my_game", false, false);
+        let xml = android_manifest(&p, "my_game", false, false, false);
         assert!(!xml.contains("appCategory"));
+    }
+
+    #[test]
+    fn manifest_for_gradle_leaves_the_id_to_the_build_file() {
+        let mut p = project();
+        p.android_dependencies = vec!["a:b:1".into()];
+        p.android_meta_data = vec![("the.key".into(), "1234".into())];
+        let xml = android_manifest(&p, "my_game", true, false, true);
+        assert!(!xml.contains(" package="));
+        assert!(!xml.contains("android:debuggable"));
+        assert!(xml.contains("android:hasCode=\"true\""));
+        assert!(xml.contains("android:name=\"the.key\" android:value=\"@string/love2drs_meta_0\""));
+    }
+
+    #[test]
+    fn bundle_modules_sort_what_gradle_makes() {
+        assert_eq!(bundle_module_path("classes2.dex"), "dex/classes2.dex");
+        assert_eq!(bundle_module_path("res/values/x.xml"), "res/values/x.xml");
+        assert_eq!(bundle_module_path("resources.pb"), "resources.pb");
+        assert_eq!(
+            bundle_module_path("play-services-base.properties"),
+            "root/play-services-base.properties"
+        );
+        assert_eq!(
+            bundle_module_path("META-INF/x.version"),
+            "root/META-INF/x.version"
+        );
     }
 
     #[test]

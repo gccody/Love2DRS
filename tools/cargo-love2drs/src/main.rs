@@ -1,6 +1,7 @@
 //! `cargo love2drs`: builds, installs and runs love2drs games on Android and iOS.
 
 mod android;
+mod gradle;
 mod icon;
 mod ios;
 mod project;
@@ -60,6 +61,8 @@ for the app itself live in the game's Cargo.toml:
     min_sdk = 26                     # Android
     target_sdk = 36                  # Android
     permissions = [\"android.permission.INTERNET\"]  # Android
+    android_dependencies = [\"group:name:1.0\"]      # Android; Java libraries, built with Gradle
+    android_meta_data = { \"key\" = \"value\" }      # Android; settings those libraries read
     app_category = \"game\"            # Android; the default, and without it Android
                                      # 16 tablets ignore orientation. \"none\" leaves
                                      # it out; others are in Android's manifest docs

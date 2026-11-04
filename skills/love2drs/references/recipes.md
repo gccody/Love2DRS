@@ -842,6 +842,21 @@ This writes `<name>.ipa` and `<name>.app.dSYM` to `target/love2drs/ios/iphoneos/
 Transporter or `xcrun altool`, and keep the `.dSYM` for reading crash reports. Without `--identity` the result is
 unsigned and needs signing before upload.
 
+Some Android SDKs only come as Java in Maven packages, like Google Play Games. List them, and any `<meta-data>` they read,
+and `cargo love2drs` has Gradle make the app's Java side. Everything else is packaged as usual, and games without
+dependencies don't need Gradle. It's found on `PATH`, in `GRADLE`, or left behind by another project's wrapper. Call the
+library through JNI, loading its classes with the activity's class loader, since `FindClass` on a thread you attached only
+sees the system's.
+
+```toml
+[package.metadata.love2drs]
+android_dependencies = ["com.google.android.gms:play-services-games-v2:22.1.0"]
+android_meta_data = { "com.google.android.gms.games.APP_ID" = "1234567890" }
+```
+
+SDK calls that take an `Activity` need `love2drs::android_app().activity_as_ptr()`.
+`ndk_context::android_context()` holds the `Application`, and passing that where an `Activity` is declared aborts the process.
+
 The tool writes the `DT*` keys App Store Connect checks and a `PrivacyInfo.xcprivacy`. The one it makes declares no
 tracking, no data collection, and the required-reason system APIs it finds in the executable, with the reason
 for ordinary use inside an app. That's only a starting point: if the game collects data or has analytics, write

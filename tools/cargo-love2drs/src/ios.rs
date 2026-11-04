@@ -758,6 +758,8 @@ mod tests {
             app_category: Some("game".into()),
             ios_deployment_target: "15.0".into(),
             privacy_manifest: None,
+            android_dependencies: vec![],
+            android_meta_data: vec![],
         }
     }
 
