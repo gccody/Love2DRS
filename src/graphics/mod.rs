@@ -259,7 +259,11 @@ fn connect(
         .create_surface(window.clone())
         .map_err(|e| gfx_err(&e))?;
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
+        power_preference: if conf.low_power {
+            wgpu::PowerPreference::LowPower
+        } else {
+            wgpu::PowerPreference::HighPerformance
+        },
         compatible_surface: Some(&surface),
         ..Default::default()
     }))

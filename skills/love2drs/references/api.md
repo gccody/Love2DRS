@@ -48,6 +48,7 @@ Conf::new(title)            // 800x600, not resizable, windowed, vsync on, msaa 
   .msaa(samples: u32)       // 1 or 4 (other values round to these)
   .min_size(w: u32, h: u32)
   .max_dt(seconds: f32)     // clamp for dt passed to update
+  .low_power(bool)          // prefer the integrated GPU on machines with two (t.graphics.lowpower); default false
 ```
 
 ## `Game` trait (all methods optional; defaults do nothing)
@@ -374,7 +375,13 @@ Windows and Linux; the first finger also produces emulated mouse events.
 
 ```rust
 delta() -> f32   fps() -> f32   average_delta() -> f32   time() -> f64   frame_count() -> u64
+set_max_fps(Option<f32>)   max_fps() -> Option<f32>   // cap the frame rate; None = every display refresh (default)
 ```
+Battery: by default every display refresh is drawn, like LÖVE. A game that sits still a lot
+(a card game, a menu) should lower the rate while nothing moves quickly, e.g.
+`ctx.timer.set_max_fps(idle.then_some(20.0))` each frame. The loop then sleeps between frames.
+Input (keys, mouse, touch, controllers, window changes) runs a frame at once, so lift the cap
+there and nothing lags. Prefer a divisor of 60 (20, 30) so frames stay evenly spaced.
 
 ## Window (`ctx.window`)
 

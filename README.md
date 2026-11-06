@@ -85,7 +85,7 @@ Apart from the logo in `mobile`, the examples generate their art and sound in co
 | `love.joystick` | `ctx.gamepad`: hot-plugged controllers in an Xbox-style layout (buttons, sticks, triggers, rumble) via [gilrs](https://crates.io/crates/gilrs) |
 | `love.touch` | `ctx.touch`: every finger on a touchscreen (position, start, delta, pressure) |
 | `love.audio` | `ctx.audio` (wav/ogg/mp3/flac, volume, pitch, looping, seek, overlapping SFX, synthesized sounds) |
-| `love.timer` | `ctx.timer` (`delta`, `fps`, `time`) |
+| `love.timer` | `ctx.timer` (`delta`, `fps`, `time`, `set_max_fps`) |
 | `love.window` | `ctx.window` (title, size, fullscreen, ...) |
 | `love.math` | `love2drs::math` (`random*`, seedable `Rng`, `noise2`, `Transform`, `Vec2`) |
 | `love.filesystem` | `love2drs::filesystem` (`read`, `save_dir`) |
@@ -96,6 +96,11 @@ Some differences from LÖVE:
 
 - **A minimized game keeps running at 30 fps.** Nothing is drawn to the screen, but `update`,
   input and audio carry on. Check `ctx.window.is_minimized()` to pause instead.
+- **No custom `love.run`, but a frame cap instead.** LÖVE games save battery by writing their own
+  loop around `love.event.wait`. Here, `ctx.timer.set_max_fps(Some(20.0))` makes the loop sleep
+  between frames while the game is quiet, and any input still runs a frame at once. Drawing every
+  refresh of a phone's screen when nothing moves is most of what drains its battery.
+  `Conf::low_power(true)` is `t.graphics.lowpower`.
 
 - **Optional arguments become builders.** `love.graphics.draw(img, x, y, r, sx, sy, ox, oy)` is
   `g.draw_ex(&img, DrawParams::at(x, y).rotation(r).scale(2.0).centered())`. The plain

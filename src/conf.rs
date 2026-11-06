@@ -25,6 +25,9 @@ pub struct Conf {
     /// Upper bound for the `dt` passed to `update`, in seconds. Prevents huge
     /// simulation steps after the window was dragged or the game was paused by the OS.
     pub max_dt: f32,
+    /// Prefer the integrated GPU on machines with two (like `t.graphics.lowpower`
+    /// in LÖVE). Phones and most PCs have one GPU, so this changes nothing there.
+    pub low_power: bool,
 }
 
 impl Default for Conf {
@@ -39,6 +42,7 @@ impl Default for Conf {
             msaa: 1,
             min_size: None,
             max_dt: 0.25,
+            low_power: false,
         }
     }
 }
@@ -94,6 +98,14 @@ impl Conf {
     /// Upper bound for `dt` in seconds (default `0.25`).
     pub fn max_dt(mut self, max_dt: f32) -> Self {
         self.max_dt = max_dt;
+        self
+    }
+
+    /// Prefer the integrated GPU on machines with two, such as laptops with a
+    /// graphics card (default `false`). It uses far less power, and a 2D game
+    /// rarely needs more.
+    pub fn low_power(mut self, low_power: bool) -> Self {
+        self.low_power = low_power;
         self
     }
 }

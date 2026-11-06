@@ -201,6 +201,7 @@ where
         error: None,
         autoshot: AutoShot::from_env(),
         last_frame: Instant::now(),
+        wake: false,
         suspended: false,
         mouse_finger: MouseFinger::default(),
         #[cfg(target_os = "android")]
@@ -252,11 +253,12 @@ fn key_event<G: Game>(
     }
 }
 
-/// Reads controller events and replays them as `Game` callbacks.
-fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) {
+/// Reads controller events and replays them as `Game` callbacks. Returns
+/// whether there were any.
+fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) -> bool {
     ctx.gamepad.poll();
     if ctx.gamepad.events.is_empty() {
-        return;
+        return false;
     }
     let mut events = std::mem::take(&mut ctx.gamepad.events);
     for ev in events.drain(..) {
@@ -272,6 +274,7 @@ fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) {
     if ctx.gamepad.events.is_empty() {
         ctx.gamepad.events = events;
     }
+    true
 }
 
 /// Testing aid:`LOVE2DRS_SCREENSHOT=out.png` saves frame
@@ -302,6 +305,9 @@ struct App<G, F> {
     error: Option<Error>,
     autoshot: AutoShot,
     last_frame: Instant,
+    /// Input arrived since the last frame, so the next one runs at once, even
+    /// under [`Timer::set_max_fps`](crate::Timer::set_max_fps).
+    wake: bool,
     /// The app is in the background, so nothing may be drawn.
     suspended: bool,
     /// The finger that acts as the mouse on mobile.
@@ -353,6 +359,9 @@ impl PauseDetector {
 
 /// Frame interval while the window is minimized (30 fps).
 const MINIMIZED_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// Controllers don't wake the event loop, so while a frame cap has it asleep
+/// they're looked at this often.
+const PAD_POLL_TIME: Duration = Duration::from_millis(16);
 
 impl<G, F> App<G, F>
 where
@@ -501,6 +510,7 @@ where
 
         let mut reader = std::mem::take(&mut self.android_input);
         reader.drain(crate::platform::android_app(), |event| {
+            self.wake = true;
             let Some((ctx, game)) = &mut self.state else {
                 return;
             };
@@ -663,6 +673,8 @@ where
             self.frame(event_loop);
             return;
         }
+        // Input, or the window changing: show what it did right away.
+        self.wake = true;
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
@@ -770,7 +782,7 @@ where
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some((ctx, _)) = &mut self.state else {
+        let Some((ctx, game)) = &mut self.state else {
             return;
         };
         #[cfg(feature = "audio")]
@@ -800,6 +812,18 @@ where
             let next = self.last_frame + MINIMIZED_FRAME_TIME;
             if Instant::now() < next {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                return;
+            }
+        }
+        // Under a frame cap, sleep until the next frame is due, unless input came in.
+        let now = Instant::now();
+        if !std::mem::take(&mut self.wake)
+            && let Some(due) = ctx.timer.next_frame(self.last_frame, now)
+        {
+            let has_pads = ctx.gamepad.ids().next().is_some();
+            if !(has_pads && poll_gamepads(ctx, game)) {
+                let wake_at = if has_pads { due.min(now + PAD_POLL_TIME) } else { due };
+                event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
                 return;
             }
         }

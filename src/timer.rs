@@ -13,7 +13,12 @@ pub struct Timer {
     fps_window_start: Instant,
     fps_window_frames: u32,
     average_dt: f32,
+    max_fps: Option<f32>,
 }
+
+/// How much earlier than the cap allows a frame starts, so it's ready for the
+/// display refresh it's meant for rather than just missing it.
+const VSYNC_SLACK: Duration = Duration::from_millis(3);
 
 impl Timer {
     pub(crate) fn new(max_dt: f32) -> Self {
@@ -28,7 +33,16 @@ impl Timer {
             fps_window_start: now,
             fps_window_frames: 0,
             average_dt: 0.0,
+            max_fps: None,
         }
+    }
+
+    /// When the frame after one that started at `last` may start, or `None`
+    /// when it may start right away.
+    pub(crate) fn next_frame(&self, last: Instant, now: Instant) -> Option<Instant> {
+        let fps = self.max_fps?;
+        let due = last + Duration::from_secs_f32(1.0 / fps).saturating_sub(VSYNC_SLACK);
+        (now < due).then_some(due)
     }
 
     /// Advances to a new frame and returns the clamped delta time.
@@ -73,5 +87,56 @@ impl Timer {
     /// Number of frames rendered so far.
     pub fn frame_count(&self) -> u64 {
         self.frames
+    }
+
+    /// Draws at most `fps` frames a second, or as many as the display shows
+    /// with `None` (the default). The loop sleeps between frames, which saves
+    /// a lot of battery while a game has little going on.
+    ///
+    /// Input never waits for the next frame: a key, click, touch, controller
+    /// press or window change runs one at once, so a game can lift the cap as
+    /// soon as the player does something. Can change every frame. Values below
+    /// 1 count as 1.
+    pub fn set_max_fps(&mut self, fps: Option<f32>) {
+        self.max_fps = fps.filter(|f| !f.is_nan()).map(|f| f.max(1.0));
+    }
+
+    /// The cap set with [`Timer::set_max_fps`].
+    pub fn max_fps(&self) -> Option<f32> {
+        self.max_fps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_cap_means_draw_now() {
+        let t = Timer::new(0.25);
+        let now = Instant::now();
+        assert_eq!(t.next_frame(now, now), None);
+    }
+
+    #[test]
+    fn a_cap_waits_until_the_frame_is_due() {
+        let mut t = Timer::new(0.25);
+        t.set_max_fps(Some(20.0));
+        let last = Instant::now();
+        let due = t.next_frame(last, last).expect("the next frame isn't due yet");
+        let wait = (due - last).as_secs_f32();
+        assert!((wait - 0.047).abs() < 1e-4, "waits {wait} s");
+        // Due, then late: draw now.
+        assert_eq!(t.next_frame(last, due), None);
+        assert_eq!(t.next_frame(last, last + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn tiny_caps_are_clamped() {
+        let mut t = Timer::new(0.25);
+        t.set_max_fps(Some(0.0));
+        assert_eq!(t.max_fps(), Some(1.0));
+        t.set_max_fps(Some(f32::NAN));
+        assert_eq!(t.max_fps(), None);
     }
 }
