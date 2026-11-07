@@ -363,6 +363,26 @@ const MINIMIZED_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// they're looked at this often.
 const PAD_POLL_TIME: Duration = Duration::from_millis(16);
 
+/// The display's refresh rate, when the loop should wait for the next refresh
+/// even without a frame cap. Only on iOS: winit's `ControlFlow::Poll` there
+/// fires the run loop again at once, so the main thread spun between frames and
+/// kept a whole core busy (measured on an iPhone: 98% CPU at 60 fps, and 100
+/// times fewer instructions once it waited). Elsewhere presenting a frame already
+/// waits for vsync, and coarse timers would make an extra wait miss refreshes.
+#[cfg(target_os = "ios")]
+fn display_pacing(ctx: &Context) -> Option<f32> {
+    if !ctx.graphics.vsync() {
+        return None;
+    }
+    let hz = ctx.window.inner.current_monitor().and_then(|m| m.refresh_rate_millihertz());
+    Some(hz.map_or(60.0, |mhz| mhz as f32 / 1000.0))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn display_pacing(_ctx: &Context) -> Option<f32> {
+    None
+}
+
 impl<G, F> App<G, F>
 where
     G: Game,
@@ -818,7 +838,7 @@ where
         // Under a frame cap, sleep until the next frame is due, unless input came in.
         let now = Instant::now();
         if !std::mem::take(&mut self.wake)
-            && let Some(due) = ctx.timer.next_frame(self.last_frame, now)
+            && let Some(due) = ctx.timer.next_frame(self.last_frame, now, display_pacing(ctx))
         {
             let has_pads = ctx.gamepad.ids().next().is_some();
             if !(has_pads && poll_gamepads(ctx, game)) {

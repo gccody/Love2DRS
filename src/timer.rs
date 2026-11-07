@@ -38,9 +38,13 @@ impl Timer {
     }
 
     /// When the frame after one that started at `last` may start, or `None`
-    /// when it may start right away.
-    pub(crate) fn next_frame(&self, last: Instant, now: Instant) -> Option<Instant> {
-        let fps = self.max_fps?;
+    /// when it may start right away. `refresh` is the display's rate, for a loop
+    /// that should wait for its next refresh even without a cap.
+    pub(crate) fn next_frame(&self, last: Instant, now: Instant, refresh: Option<f32>) -> Option<Instant> {
+        let fps = match (self.max_fps, refresh) {
+            (Some(cap), Some(refresh)) => cap.min(refresh),
+            (cap, refresh) => cap.or(refresh)?,
+        };
         let due = last + Duration::from_secs_f32(1.0 / fps).saturating_sub(VSYNC_SLACK);
         (now < due).then_some(due)
     }
@@ -115,7 +119,20 @@ mod tests {
     fn no_cap_means_draw_now() {
         let t = Timer::new(0.25);
         let now = Instant::now();
-        assert_eq!(t.next_frame(now, now), None);
+        assert_eq!(t.next_frame(now, now, None), None);
+    }
+
+    #[test]
+    fn the_display_paces_an_uncapped_loop() {
+        let mut t = Timer::new(0.25);
+        let last = Instant::now();
+        let wait = (t.next_frame(last, last, Some(60.0)).unwrap() - last).as_secs_f32();
+        assert!((wait - (1.0 / 60.0 - 0.003)).abs() < 1e-4, "waits {wait} s");
+        // A cap below the display's rate wins, one above it doesn't.
+        t.set_max_fps(Some(20.0));
+        assert!(t.next_frame(last, last, Some(60.0)).unwrap() - last > Duration::from_millis(40));
+        t.set_max_fps(Some(240.0));
+        assert!(t.next_frame(last, last, Some(60.0)).unwrap() - last > Duration::from_millis(13));
     }
 
     #[test]
@@ -123,12 +140,12 @@ mod tests {
         let mut t = Timer::new(0.25);
         t.set_max_fps(Some(20.0));
         let last = Instant::now();
-        let due = t.next_frame(last, last).expect("the next frame isn't due yet");
+        let due = t.next_frame(last, last, None).expect("the next frame isn't due yet");
         let wait = (due - last).as_secs_f32();
         assert!((wait - 0.047).abs() < 1e-4, "waits {wait} s");
         // Due, then late: draw now.
-        assert_eq!(t.next_frame(last, due), None);
-        assert_eq!(t.next_frame(last, last + Duration::from_secs(1)), None);
+        assert_eq!(t.next_frame(last, due, None), None);
+        assert_eq!(t.next_frame(last, last + Duration::from_secs(1), None), None);
     }
 
     #[test]

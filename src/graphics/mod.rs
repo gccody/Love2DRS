@@ -686,6 +686,12 @@ impl Graphics {
         self.scale_factor
     }
 
+    /// Whether presentation waits for the display's refresh.
+    #[cfg(target_os = "ios")]
+    pub(crate) fn vsync(&self) -> bool {
+        self.config.present_mode == present_mode(true)
+    }
+
     /// Enables or disables vertical sync.
     pub fn set_vsync(&mut self, vsync: bool) {
         self.config.present_mode = present_mode(vsync);
