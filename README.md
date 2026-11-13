@@ -305,13 +305,14 @@ above were captured this way. In game code, call `ctx.graphics.capture_screensho
 ## Where the time goes
 
 Set `LOVE2DRS_FRAME_LOG=1` and any love2drs game prints a line a second to stderr: how many frames
-it drew, how often the loop woke up, how busy the main thread was, the milliseconds each part of a
-frame took, and the GPU's time for each render pass (where the driver can time them).
+it drew, how often the loop woke up, how busy the main thread was, how much of a core the whole
+process used, the milliseconds each part of a frame took, and the GPU's time for each render pass
+(where the driver can time them).
 
 ```text
-love2drs: 240 frames, 240 wakeups (0 by the OS) in 1.00 s, busy 5.4% | ms per frame: input 0.00,
-update 0.01, draw 0.05, acquire 3.79, encode 0.06, submit 0.10, present 0.10 | 2 passes, 28 draws
-per frame | gpu ms per pass: 0.142 + 0.120 = 6.3% busy
+love2drs: 240 frames, 240 wakeups (0 by the OS) in 1.00 s, busy 5.4%, cpu 9.8% | ms per frame:
+input 0.00, update 0.01, draw 0.05, acquire 3.79, encode 0.06, submit 0.10, present 0.10 | 2 passes,
+28 draws per frame | gpu ms per pass: 0.142 + 0.120 = 6.3% busy
 ```
 
 Nothing can set an environment variable for an app on a phone, so there an empty file named
@@ -319,6 +320,8 @@ Nothing can set an environment variable for an app on a phone, so there an empty
 files/love2drs-frame-log`). The lines go to logcat on Android and to the system log on iOS.
 
 `acquire` (or `present` on some drivers) is the wait for the display, which isn't counted as busy.
+`busy` only sees the loop's own code on the main thread. `cpu` is what the OS charged the process:
+every thread, and the work the system does around each frame.
 It's the quickest way to see what a change does to a game's battery use: fewer wakeups, fewer
 passes and less busy time are all less power.
 

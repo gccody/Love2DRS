@@ -5,13 +5,17 @@
 //! busy time split by phase, so a change can be judged without a profiler:
 //!
 //! ```text
-//! love2drs: 240 frames, 240 wakeups (0 by the OS) in 1.00 s, busy 5.4% | ms per frame: input 0.00,
-//! update 0.01, draw 0.05, acquire 3.79, encode 0.06, submit 0.10, present 0.10 | 2 passes, 28 draws
-//! per frame | gpu ms per pass: 0.142 + 0.120 = 6.3% busy
+//! love2drs: 240 frames, 240 wakeups (0 by the OS) in 1.00 s, busy 5.4%, cpu 9.8% | ms per frame:
+//! input 0.00, update 0.01, draw 0.05, acquire 3.79, encode 0.06, submit 0.10, present 0.10 | 2 passes,
+//! 28 draws per frame | gpu ms per pass: 0.142 + 0.120 = 6.3% busy
 //! ```
 //!
 //! "By the OS" counts waits that a message cut short, such as the mouse moving. The
 //! GPU times need a driver with timestamp queries, and are left out without one.
+//!
+//! "Busy" is the main thread inside the loop's own code. "cpu" is what the OS charged
+//! the whole process, as a share of one core: every thread, and the work the system
+//! does on the loop's behalf around each frame, which "busy" can't see.
 //!
 //! Nothing can set an environment variable for an app on a phone, so there an
 //! empty file named `love2drs-frame-log` in the save directory turns it on too.
@@ -99,6 +103,61 @@ fn print(line: &str) {
     unsafe { NSLog(&*format, &*line as *const NSString) };
 }
 
+/// The CPU time the whole process has used so far, on every thread.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn cpu_time() -> Option<Duration> {
+    use std::ffi::{c_int, c_long};
+
+    /// `struct timespec` where `time_t` is a `long`, as it is on all of these.
+    #[repr(C)]
+    struct Timespec {
+        seconds: c_long,
+        nanos: c_long,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: c_int, time: *mut Timespec) -> c_int;
+    }
+    const PROCESS_CPU_TIME: c_int = if cfg!(target_vendor = "apple") { 12 } else { 2 };
+    let mut time = Timespec { seconds: 0, nanos: 0 };
+    // SAFETY: `time` is a `timespec` the call may write to.
+    let ok = unsafe { clock_gettime(PROCESS_CPU_TIME, &mut time) } == 0;
+    ok.then(|| Duration::new(time.seconds as u64, time.nanos as u32))
+}
+
+#[cfg(windows)]
+fn cpu_time() -> Option<Duration> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            created: *mut FileTime,
+            exited: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut created, mut exited, mut kernel, mut user) = Default::default();
+    // SAFETY: the handle is the process's own, and each pointer is to a `FILETIME`.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    // In units of 100 ns.
+    let ticks = |t: &FileTime| u64::from(t.high) << 32 | u64::from(t.low);
+    ok.then(|| Duration::from_nanos((ticks(&kernel) + ticks(&user)) * 100))
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows)))]
+fn cpu_time() -> Option<Duration> {
+    None
+}
+
 /// Runs `f`, counting how long it took as `phase`.
 #[inline]
 pub(crate) fn time<T>(phase: Phase, f: impl FnOnce() -> T) -> T {
@@ -132,6 +191,8 @@ fn add(phase: Phase, elapsed: Duration) {
 /// Counts the loop's wakeups and frames, and prints the totals every second.
 pub(crate) struct FrameLog {
     since: Instant,
+    /// The process's CPU time at `since`.
+    cpu: Option<Duration>,
     busy: Duration,
     wakeups: u32,
     /// Wakeups that weren't the loop's own doing: a message from the OS.
@@ -145,6 +206,7 @@ impl FrameLog {
     pub fn new() -> Self {
         FrameLog {
             since: Instant::now(),
+            cpu: enabled().then(cpu_time).flatten(),
             busy: Duration::ZERO,
             wakeups: 0,
             woken: 0,
@@ -214,8 +276,15 @@ impl FrameLog {
             let share = gpu.iter().sum::<f64>() * self.frames as f64 / 10.0 / elapsed.as_secs_f64();
             format!(" | gpu ms per pass: {} = {:.1}% busy", passes.join(" + "), share)
         };
+        let cpu = match (self.cpu, cpu_time()) {
+            (Some(before), Some(after)) => {
+                let used = after.saturating_sub(before).as_secs_f32();
+                format!(", cpu {:.1}%", 100.0 * used / elapsed.as_secs_f32())
+            }
+            _ => String::new(),
+        };
         print(&format!(
-            "love2drs: {} frames, {} wakeups ({} by the OS) in {:.2} s, busy {:.1}% | ms per frame: {} | {} passes, {} draws per frame{gpu}",
+            "love2drs: {} frames, {} wakeups ({} by the OS) in {:.2} s, busy {:.1}%{cpu} | ms per frame: {} | {} passes, {} draws per frame{gpu}",
             self.frames,
             self.wakeups,
             self.woken,
