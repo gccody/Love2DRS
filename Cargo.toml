@@ -24,7 +24,7 @@ audio = ["dep:rodio", "dep:objc2-avf-audio", "dep:block2"]
 ## Gamepad input via gilrs. On Linux, building it needs the libudev headers
 ## (`libudev-dev` on Debian/Ubuntu, `systemd-devel` on Fedora). On Windows and
 ## macOS it also pulls in hidapi to drive PlayStation controllers directly.
-gamepad = ["dep:gilrs", "dep:hidapi", "dep:objc2-game-controller", "dep:objc2-core-haptics"]
+gamepad = ["dep:gilrs", "dep:hidapi", "dep:windows-sys", "dep:objc2-game-controller", "dep:objc2-core-haptics"]
 ## PNG decoding for `Graphics::new_image`.
 png = ["image/png"]
 ## JPEG decoding for `Graphics::new_image`.
@@ -53,6 +53,11 @@ rodio = { version = "0.22", default-features = false, features = ["playback", "w
 # opening pads exclusively, which would take them from other apps.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 hidapi = { version = "2.6", default-features = false, features = ["windows-native", "macos-shared-device"], optional = true }
+
+# The list of plugged-in controllers, so gilrs and its polling thread only run when
+# there's one for it to read (see src/input/windows_pads.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input"], optional = true }
 
 # NativeActivity needs no Java, so an APK can be packaged without Gradle.
 [target.'cfg(target_os = "android")'.dependencies]

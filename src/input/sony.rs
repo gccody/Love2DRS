@@ -311,9 +311,9 @@ impl Rumble {
 #[cfg(any(windows, target_os = "macos"))]
 mod imp {
     use std::ffi::{CStr, CString};
-    use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
     use std::thread::JoinHandle;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use hidapi::{BusType, HidApi, HidDevice};
 
@@ -325,6 +325,15 @@ mod imp {
     /// How long the worker waits for an input report before checking for
     /// rumble commands; bounds rumble latency and timing error.
     const POLL_MS: i32 = 4;
+
+    /// How long a pad is left alone before its worker stops waking for every
+    /// report. A controller sends hundreds a second whether or not anyone's
+    /// holding it, and waking for each costs more than the whole of an idle game.
+    const RESTING_AFTER: Duration = Duration::from_secs(3);
+    /// How often a resting pad's reports are read, all at once: a frame at 60 Hz,
+    /// which is the most the first press after a rest can be late by. Every
+    /// report is still looked at, so a tap shorter than this isn't missed.
+    const RESTING_POLL: Duration = Duration::from_millis(16);
 
     /// A scan's request: the paths already open, and where to send what it finds.
     type Scan = (Vec<CString>, Sender<Vec<Pad>>);
@@ -562,36 +571,60 @@ mod imp {
                 log::warn!("PlayStation rumble failed: {e}");
             }
         };
-        loop {
-            match dev.read_timeout(&mut buf, POLL_MS) {
-                Ok(0) => {}
-                Ok(n) => {
-                    let data = &buf[..n];
-                    // Full-length reports only exist on Bluetooth: trust them
-                    // over a bus type the OS might not have reported.
-                    if matches!(
-                        (kind, data[0]),
-                        (Kind::DualSense { .. }, 0x31) | (Kind::DualShock4, 0x11)
-                    ) {
-                        bluetooth = true;
-                    }
-                    if let Some(input) = parse_input(kind, bluetooth, data)
-                        && last != Some(input)
-                    {
-                        last = Some(input);
-                        if msgs.send(Msg::Input(input)).is_err() {
-                            break; // the pad was dropped
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::debug!("PlayStation controller gone: {e}");
-                    let _ = msgs.send(Msg::Gone);
-                    return;
+        let mut touched = Instant::now();
+        'serve: loop {
+            // A pad nobody has touched for a while, and that isn't rumbling, rests:
+            // the worker sleeps (a command still wakes it at once) and then reads
+            // whatever reports queued up, rather than waking for each.
+            let resting = rumble.motors == (0, 0) && touched.elapsed() >= RESTING_AFTER;
+            let mut early = None;
+            if resting {
+                match cmds.recv_timeout(RESTING_POLL) {
+                    Ok(cmd) => early = Some(cmd),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
             loop {
-                match cmds.try_recv() {
+                match dev.read_timeout(&mut buf, if resting { 0 } else { POLL_MS }) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        // Full-length reports only exist on Bluetooth: trust them
+                        // over a bus type the OS might not have reported.
+                        if matches!(
+                            (kind, data[0]),
+                            (Kind::DualSense { .. }, 0x31) | (Kind::DualShock4, 0x11)
+                        ) {
+                            bluetooth = true;
+                        }
+                        if let Some(input) = parse_input(kind, bluetooth, data)
+                            && last != Some(input)
+                        {
+                            last = Some(input);
+                            touched = Instant::now();
+                            if msgs.send(Msg::Input(input)).is_err() {
+                                break 'serve; // the pad was dropped
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("PlayStation controller gone: {e}");
+                        let _ = msgs.send(Msg::Gone);
+                        return;
+                    }
+                }
+                // Awake, one report at a time, so rumble stays on time.
+                if !resting {
+                    break;
+                }
+            }
+            loop {
+                let cmd = match early.take() {
+                    Some(cmd) => Ok(cmd),
+                    None => cmds.try_recv(),
+                };
+                match cmd {
                     Ok(Cmd::Rumble {
                         left,
                         right,

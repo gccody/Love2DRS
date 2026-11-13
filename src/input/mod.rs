@@ -9,6 +9,8 @@ pub mod keyboard;
 pub mod mouse;
 #[cfg(feature = "gamepad")]
 mod sony;
+#[cfg(all(windows, feature = "gamepad"))]
+mod windows_pads;
 pub mod touch;
 
 pub use gamepad::{Gamepad, GamepadAxis, GamepadButton, GamepadId, Gamepads};

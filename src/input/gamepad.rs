@@ -10,6 +10,10 @@
 //! instead (see `sony.rs`), since gilrs can't rumble them there. gilrs doesn't
 //! support Android and iOS, which have their own backends (`android.rs` and
 //! `ios_pad.rs`).
+//!
+//! On Windows gilrs only runs while a controller that needs it is plugged in
+//! (see `windows_pads.rs`): it polls on a thread of its own, which is a lot of
+//! waking up for a game nobody is holding a controller for.
 
 #[cfg(feature = "gamepad")]
 use std::time::{Duration, Instant};
@@ -29,7 +33,7 @@ const AXIS_BUTTON_THRESHOLD: f32 = 0.5;
 /// How long a PlayStation pad that gilrs reports may take to show up over HID
 /// before it's shown through gilrs instead (e.g. another app holds it open).
 #[cfg(feature = "gamepad")]
-const HID_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const HID_GRACE: Duration = Duration::from_secs(2);
 /// How often to look for it over HID in the meantime.
 #[cfg(feature = "gamepad")]
 const HID_RESCAN: Duration = Duration::from_millis(250);
@@ -415,6 +419,9 @@ pub struct Gamepads {
     hidden: Vec<Hidden>,
     #[cfg(feature = "gamepad")]
     next_scan: Option<Instant>,
+    /// What's plugged in, which decides whether gilrs runs.
+    #[cfg(all(feature = "gamepad", windows))]
+    watch: super::windows_pads::Watch,
     #[cfg(all(feature = "gamepad", target_os = "android"))]
     next_android_scan: Option<Instant>,
 }
@@ -425,47 +432,112 @@ impl Gamepads {
         let mut pads = Gamepads {
             pads: Vec::new(),
             events: Vec::new(),
-            #[cfg(all(feature = "gamepad", any(target_os = "android", target_os = "ios")))]
+            #[cfg(feature = "gamepad")]
             gilrs: None,
-            #[cfg(all(
-                feature = "gamepad",
-                not(any(target_os = "android", target_os = "ios"))
-            ))]
-            gilrs: match gilrs::Gilrs::new() {
-                Ok(g) => Some(g),
-                Err(gilrs::Error::NotImplemented(g)) => {
-                    log::warn!("gamepads are not supported on this platform");
-                    Some(g)
-                }
-                Err(e) => {
-                    log::warn!("gamepad support unavailable: {e}");
-                    None
-                }
-            },
             #[cfg(feature = "gamepad")]
             sony: sony::Hid::new(),
             #[cfg(feature = "gamepad")]
             hidden: Vec::new(),
             #[cfg(feature = "gamepad")]
             next_scan: None,
+            #[cfg(all(feature = "gamepad", windows))]
+            watch: super::windows_pads::Watch::new(),
             #[cfg(all(feature = "gamepad", target_os = "android"))]
             next_android_scan: None,
         };
         // Controllers that were plugged in before the game started are
         // announced as `gamepad_added` on the first frame, like LÖVE does.
-        #[cfg(feature = "gamepad")]
-        if let Some(gilrs) = &pads.gilrs {
-            let ids: Vec<_> = gilrs.gamepads().map(|(id, _)| id).collect();
-            for id in ids {
-                pads.connect(id);
-            }
-        }
-        #[cfg(feature = "gamepad")]
+        // Windows: gilrs starts, and PlayStation pads are scanned for, only if
+        // one is plugged in.
+        #[cfg(all(feature = "gamepad", windows))]
+        pads.follow_devices(Instant::now());
+        #[cfg(all(
+            feature = "gamepad",
+            not(any(windows, target_os = "android", target_os = "ios"))
+        ))]
         {
+            pads.start_gilrs();
             pads.scan_hid();
             pads.next_scan = None;
         }
         pads
+    }
+
+    /// Starts gilrs and lists the controllers it already has. Returns whether
+    /// it started.
+    #[cfg(all(
+        feature = "gamepad",
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
+    fn start_gilrs(&mut self) -> bool {
+        self.gilrs = match gilrs::Gilrs::new() {
+            Ok(g) => Some(g),
+            Err(gilrs::Error::NotImplemented(g)) => {
+                log::warn!("gamepads are not supported on this platform");
+                Some(g)
+            }
+            Err(e) => {
+                log::warn!("gamepad support unavailable: {e}");
+                None
+            }
+        };
+        let Some(gilrs) = &self.gilrs else {
+            return false;
+        };
+        let ids: Vec<_> = gilrs.gamepads().map(|(id, _)| id).collect();
+        for id in ids {
+            self.connect(id);
+        }
+        true
+    }
+
+    /// Stops gilrs, and with it the thread it polls on. Its controllers are
+    /// gone already, or go now.
+    #[cfg(all(feature = "gamepad", windows))]
+    fn stop_gilrs(&mut self) {
+        self.hidden.clear();
+        let (gone, kept) = std::mem::take(&mut self.pads)
+            .into_iter()
+            .partition(|p| p.gilrs_id().is_some());
+        self.pads = kept;
+        for pad in gone {
+            self.events.push(GamepadEvent::Removed(pad.id));
+        }
+        self.gilrs = None;
+    }
+
+    /// Looks at what's plugged in twice a second: opens new PlayStation pads,
+    /// and runs gilrs only while there's a controller that needs it.
+    #[cfg(all(feature = "gamepad", windows))]
+    fn follow_devices(&mut self, now: Instant) {
+        use super::windows_pads::Unread;
+
+        if !self.watch.due(now) {
+            return;
+        }
+        let wanted = match self.watch.census() {
+            Some(census) if self.sony.available() => {
+                let open = |pads: &Self| pads.pads.iter().filter(|p| p.hid().is_some()).count();
+                let mut unread = self.watch.playstation(census.playstation, open(self), now);
+                if matches!(unread, Unread::Since(_)) {
+                    self.scan_hid();
+                    self.next_scan = None;
+                    unread = self.watch.playstation(census.playstation, open(self), now);
+                }
+                census.others > 0 || unread == Unread::GivenUp
+            }
+            Some(census) => census.others + census.playstation > 0,
+            // Windows wouldn't say, so do without the saving, not the controllers.
+            None => true,
+        };
+        if wanted {
+            self.watch.keep_gilrs(true, now);
+            if self.gilrs.is_none() && !self.watch.gilrs_failed {
+                self.watch.gilrs_failed = !self.start_gilrs();
+            }
+        } else if self.gilrs.is_some() && !self.watch.keep_gilrs(false, now) {
+            self.stop_gilrs();
+        }
     }
 
     /// The number of connected controllers.
@@ -647,6 +719,8 @@ impl Gamepads {
     pub(crate) fn poll(&mut self) {
         #[cfg(feature = "gamepad")]
         {
+            #[cfg(windows)]
+            self.follow_devices(Instant::now());
             self.poll_gilrs();
             self.poll_hid();
             self.reconcile_hid(Instant::now());
@@ -1160,6 +1234,8 @@ mod tests {
             hidden: Vec::new(),
             #[cfg(feature = "gamepad")]
             next_scan: None,
+            #[cfg(all(feature = "gamepad", windows))]
+            watch: super::super::windows_pads::Watch::new(),
             #[cfg(all(feature = "gamepad", target_os = "android"))]
             next_android_scan: None,
         }

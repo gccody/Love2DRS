@@ -285,6 +285,9 @@ privacy_manifest = "ios/PrivacyInfo.xcprivacy"  # iOS; default: made for you, se
   Edge) rumble on Windows and macOS too, over USB or Bluetooth: love2drs reads and drives them
   directly over HID there, since the OS gamepad APIs can't rumble them. Other controllers can't
   rumble on macOS, so `set_vibration` returns `false` for them.
+  A game nobody holds a controller for doesn't pay for one: on Windows the thread that polls
+  controllers only runs while one is plugged in that needs it, and a PlayStation pad left alone
+  for a few seconds is read 60 times a second instead of for every report it sends.
   Android reads controllers through its input queue and Java APIs, and iOS through the GameController and
   CoreHaptics frameworks. On both, held buttons are released and rumble stops when the app is suspended.
 - **Touch** events come from touchscreens on Android, iOS, Windows and Linux. macOS has no touchscreens:
