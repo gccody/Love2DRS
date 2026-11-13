@@ -157,6 +157,9 @@ pub struct Graphics {
     msaa_view: Option<wgpu::TextureView>,
     scale_factor: f32,
     minimized: bool,
+    /// The last frame had nowhere to go: the window is covered, on another
+    /// desktop, or the screen is locked or asleep.
+    surface_hidden: bool,
     renderer: Renderer,
     atlas: GlyphAtlas,
     frame: FrameData,
@@ -394,6 +397,7 @@ impl Graphics {
             msaa_view: None,
             scale_factor: window.scale_factor() as f32,
             minimized: size.width == 0 || size.height == 0,
+            surface_hidden: false,
             renderer,
             atlas,
             frame: FrameData::default(),
@@ -471,7 +475,9 @@ impl Graphics {
         self.open_pass(Some(self.background));
     }
 
-    pub(crate) fn end_frame(&mut self) {
+    /// Renders what was recorded. With `present` unset nothing goes to the window
+    /// (canvases are still drawn), for a frame the game wasn't asked to draw.
+    pub(crate) fn end_frame(&mut self, present: bool) {
         if self.state.canvas.is_some() {
             log::warn!("set_canvas(None) was not called before the end of draw()");
             self.set_canvas(None);
@@ -482,7 +488,7 @@ impl Graphics {
         let mut surface_texture = None;
         let mut reconfigure = false;
         let mut surface_lost = false;
-        if let Some(surface) = self.surface.as_ref().filter(|_| !self.minimized) {
+        if let Some(surface) = self.surface.as_ref().filter(|_| present && !self.minimized) {
             match framelog::time(Phase::Acquire, || surface.get_current_texture()) {
                 wgpu::CurrentSurfaceTexture::Success(t) => surface_texture = Some(t),
                 wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -491,9 +497,15 @@ impl Graphics {
                 }
                 wgpu::CurrentSurfaceTexture::Outdated => reconfigure = true,
                 wgpu::CurrentSurfaceTexture::Lost => surface_lost = true,
-                wgpu::CurrentSurfaceTexture::Timeout
-                | wgpu::CurrentSurfaceTexture::Occluded
-                | wgpu::CurrentSurfaceTexture::Validation => {}
+                // What a window that can't be seen gets, at once and without the wait
+                // for the display that paces the loop.
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    self.surface_hidden = true;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {}
+            }
+            if surface_texture.is_some() {
+                self.surface_hidden = false;
             }
         }
 
@@ -631,6 +643,7 @@ impl Graphics {
 
     /// Lets go of the window's surface while the app is in the background.
     pub(crate) fn suspend(&mut self) {
+        self.surface_hidden = false;
         self.surface = None;
         self.surface_recovery.ok();
     }
@@ -696,9 +709,14 @@ impl Graphics {
     }
 
     /// Whether presentation waits for the display's refresh.
-    #[cfg(target_os = "ios")]
     pub(crate) fn vsync(&self) -> bool {
         self.config.present_mode == present_mode(true)
+    }
+
+    /// Whether the last frame the window was offered had nowhere to go, because
+    /// the window is covered or the screen is off.
+    pub(crate) fn surface_hidden(&self) -> bool {
+        self.surface_hidden
     }
 
     /// Enables or disables vertical sync.

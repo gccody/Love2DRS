@@ -94,8 +94,9 @@ Apart from the logo in `mobile`, the examples generate their art and sound in co
 
 Some differences from LÖVE:
 
-- **A minimized game keeps running at 30 fps.** Nothing is drawn to the screen, but `update`,
-  input and audio carry on. Check `ctx.window.is_minimized()` to pause instead.
+- **A minimized game keeps running at 30 fps.** `draw` isn't called (as in LÖVE's `love.run`), but
+  `update`, input and audio carry on. Check `ctx.window.is_minimized()` to pause instead. The same
+  goes for a window that can't be seen: covered on macOS, or behind a locked or sleeping screen.
 - **No custom `love.run`, but a frame cap instead.** LÖVE games save battery by writing their own
   loop around `love.event.wait`. Here, `ctx.timer.set_max_fps(Some(20.0))` makes the loop sleep
   between frames while the game is quiet, and any input still runs a frame at once. Drawing every

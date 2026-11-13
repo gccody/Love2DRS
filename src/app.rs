@@ -208,6 +208,12 @@ where
         wake: false,
         suspended: false,
         pad_used: None,
+        occluded: false,
+        last_draw: Instant::now(),
+        draw_next: false,
+        refresh: None,
+        refresh_checked: None,
+        runaway: RunawayGuard::default(),
         mouse_finger: MouseFinger::default(),
         log: FrameLog::new(),
         #[cfg(target_os = "android")]
@@ -331,6 +337,17 @@ struct App<G, F> {
     suspended: bool,
     /// When a controller last did something.
     pad_used: Option<Instant>,
+    /// The OS says the window can't be seen (macOS and iOS do).
+    occluded: bool,
+    /// When `Game::draw` last ran.
+    last_draw: Instant,
+    /// Something happened to the window, so the next frame is drawn even if the
+    /// window seemed hidden: it may be how it came back.
+    draw_next: bool,
+    /// The display's refresh rate, and when it was asked for.
+    refresh: Option<f32>,
+    refresh_checked: Option<Instant>,
+    runaway: RunawayGuard,
     /// The finger that acts as the mouse on mobile.
     mouse_finger: MouseFinger,
     /// `LOVE2DRS_FRAME_LOG`: where the loop's time goes.
@@ -380,8 +397,16 @@ impl PauseDetector {
     }
 }
 
-/// Frame interval while the window is minimized (30 fps).
-const MINIMIZED_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// Frame interval while the window is minimized or can't be seen (30 fps).
+const HIDDEN_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// How often a window that can't be seen is drawn anyway, to find out when it can
+/// be seen again even if the OS never says so.
+const HIDDEN_DRAW_TIME: Duration = Duration::from_millis(250);
+/// How often to ask which display the window is on and how fast it is.
+const REFRESH_CHECK_TIME: Duration = Duration::from_secs(2);
+/// The frame rate to hold a loop to when it runs away and the display's rate
+/// isn't known.
+const UNKNOWN_REFRESH: f32 = 250.0;
 /// Controllers don't wake the event loop, so while a frame cap has it asleep
 /// they're looked at this often.
 const PAD_POLL_TIME: Duration = Duration::from_millis(16);
@@ -401,17 +426,61 @@ const IDLE_PAD_POLL_TIME: Duration = Duration::from_millis(50);
 /// times fewer instructions once it waited). Elsewhere presenting a frame already
 /// waits for vsync, and coarse timers would make an extra wait miss refreshes.
 #[cfg(target_os = "ios")]
-fn display_pacing(ctx: &Context) -> Option<f32> {
-    if !ctx.graphics.vsync() {
-        return None;
-    }
-    let hz = ctx.window.inner.current_monitor().and_then(|m| m.refresh_rate_millihertz());
-    Some(hz.map_or(60.0, |mhz| mhz as f32 / 1000.0))
+fn display_pacing(ctx: &Context, refresh: Option<f32>) -> Option<f32> {
+    ctx.graphics.vsync().then_some(refresh.unwrap_or(60.0))
 }
 
 #[cfg(not(target_os = "ios"))]
-fn display_pacing(_ctx: &Context) -> Option<f32> {
+fn display_pacing(_ctx: &Context, _refresh: Option<f32>) -> Option<f32> {
     None
+}
+
+/// Holds the loop to the display's rate when presenting doesn't.
+///
+/// Presenting with vsync is what paces the loop, and sometimes nothing waits: a
+/// driver told to ignore vsync, a compositor that's stopped showing the window.
+/// The loop would then draw thousands of frames a second that nobody can see.
+///
+/// A frame that waited for the display took most of a refresh. A few in a row
+/// that didn't are normal, while a new swapchain's queue fills up, so it takes
+/// [`RUNAWAY_FRAMES`] of them before the loop is paced by a timer instead. That
+/// would keep the queue from ever filling again, so every [`RUNAWAY_HOLD`] the
+/// timer lets go for long enough to see whether presenting waits by now.
+#[derive(Default)]
+struct RunawayGuard {
+    /// Frames in a row that came back in under half a refresh.
+    fast_frames: u32,
+    /// The frame that was last counted, by when it started.
+    counted: Option<Instant>,
+    holding_until: Option<Instant>,
+}
+
+/// More than any swapchain queues up.
+const RUNAWAY_FRAMES: u32 = 8;
+const RUNAWAY_HOLD: Duration = Duration::from_secs(1);
+
+impl RunawayGuard {
+    /// When the frame after the one that started at `last` may start, or `None`
+    /// for at once.
+    fn next_frame(&mut self, last: Instant, now: Instant, refresh: Option<f32>) -> Option<Instant> {
+        let period = Duration::from_secs_f32(1.0 / refresh.unwrap_or(UNKNOWN_REFRESH));
+        let due = last + period;
+        if let Some(until) = self.holding_until {
+            if now < until {
+                return (now < due).then_some(due);
+            }
+            *self = RunawayGuard::default();
+        }
+        if self.counted != Some(last) {
+            self.counted = Some(last);
+            self.fast_frames = if now - last < period / 2 { self.fast_frames + 1 } else { 0 };
+        }
+        if self.fast_frames < RUNAWAY_FRAMES {
+            return None;
+        }
+        self.holding_until = Some(now + RUNAWAY_HOLD);
+        (now < due).then_some(due)
+    }
 }
 
 impl<G, F> App<G, F>
@@ -497,14 +566,29 @@ where
         ctx.gamepad.end_frame();
         ctx.touch.end_frame();
 
+        // A window nobody can see isn't drawn, as in LÖVE. It is after anything
+        // happens to it, and a few times a second regardless, which is how a
+        // window the OS never reported as back gets noticed.
+        let hidden = ctx.window.is_minimized() || ctx.graphics.surface_hidden();
+        let draw = !hidden
+            || std::mem::take(&mut self.draw_next)
+            || self.last_frame - self.last_draw >= HIDDEN_DRAW_TIME
+            || self.autoshot.path.is_some();
         ctx.graphics.begin_frame();
-        framelog::time(Phase::Draw, || game.draw(ctx));
+        if draw {
+            self.last_draw = self.last_frame;
+            framelog::time(Phase::Draw, || game.draw(ctx));
+        }
         if let Some(path) = &self.autoshot.path
             && ctx.timer.frame_count() == self.autoshot.frame
         {
             ctx.graphics.capture_screenshot(path.clone());
         }
-        ctx.graphics.end_frame();
+        ctx.graphics.end_frame(draw);
+        if draw && !ctx.graphics.surface_hidden() {
+            // It reached the screen, whatever the OS said last.
+            self.occluded = false;
+        }
         self.log.frame(ctx.graphics.stats());
         if ctx.graphics.take_out_of_memory() {
             game.low_memory(ctx);
@@ -566,6 +650,7 @@ where
         let mut reader = std::mem::take(&mut self.android_input);
         reader.drain(crate::platform::android_app(), |event| {
             self.wake = true;
+            self.draw_next = true;
             let Some((ctx, game)) = &mut self.state else {
                 return;
             };
@@ -755,6 +840,7 @@ where
         }
         // Input, or the window changing: show what it did right away.
         self.wake = true;
+        self.draw_next = true;
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
@@ -816,6 +902,7 @@ where
                 let d = ctx.mouse.moved(vec2(p.x, p.y));
                 game.mouse_moved(ctx, p.x, p.y, d.x, d.y);
             }
+            WindowEvent::Occluded(occluded) => self.occluded = occluded,
             WindowEvent::CursorEntered { .. } => ctx.mouse.inside = true,
             WindowEvent::CursorLeft { .. } => ctx.mouse.inside = false,
             WindowEvent::MouseInput { state, button, .. } => {
@@ -887,19 +974,26 @@ where
                 return;
             }
         }
-        // Nothing is presented while minimized, so vsync no longer paces the
-        // loop. Keep the game running, but at a capped rate.
-        if ctx.window.is_minimized() {
-            let next = self.last_frame + MINIMIZED_FRAME_TIME;
-            if Instant::now() < next {
+        // Nothing is presented while the window is minimized or can't be seen, so
+        // vsync no longer paces the loop. Keep the game running, but at a capped
+        // rate. A screenshot run counts frames, so it's left to run.
+        let now = Instant::now();
+        let hidden = ctx.window.is_minimized() || self.occluded || ctx.graphics.surface_hidden();
+        if hidden && self.autoshot.path.is_none() {
+            let next = self.last_frame + HIDDEN_FRAME_TIME;
+            if now < next {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
                 return;
             }
         }
+        if self.refresh_checked.is_none_or(|at| now - at >= REFRESH_CHECK_TIME) {
+            self.refresh_checked = Some(now);
+            let monitor = ctx.window.inner.current_monitor();
+            self.refresh = monitor.and_then(|m| m.refresh_rate_millihertz()).map(|mhz| mhz as f32 / 1000.0);
+        }
         // Under a frame cap, sleep until the next frame is due, unless input came in.
-        let now = Instant::now();
         if !std::mem::take(&mut self.wake)
-            && let Some(due) = ctx.timer.next_frame(self.last_frame, now, display_pacing(ctx))
+            && let Some(due) = ctx.timer.next_frame(self.last_frame, now, display_pacing(ctx, self.refresh))
         {
             let has_pads = ctx.gamepad.ids().next().is_some();
             let news = if has_pads { poll_gamepads(ctx, game) } else { PadNews::Nothing };
@@ -918,6 +1012,13 @@ where
                 return;
             }
         }
+        if ctx.graphics.vsync()
+            && self.autoshot.path.is_none()
+            && let Some(due) = self.runaway.next_frame(self.last_frame, now, self.refresh)
+        {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            return;
+        }
         event_loop.set_control_flow(ControlFlow::Poll);
         ctx.window.inner.request_redraw();
     }
@@ -926,6 +1027,51 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `frames` frames that each come back after `took`, as a loop that
+    /// starts the next one as soon as the guard allows. Returns how long they took.
+    fn run_frames(guard: &mut RunawayGuard, frames: u32, took: Duration, refresh: Option<f32>) -> Duration {
+        let start = Instant::now();
+        let mut last = start;
+        for _ in 0..frames {
+            let done = last + took;
+            last = guard.next_frame(last, done, refresh).unwrap_or(done);
+        }
+        last - start
+    }
+
+    #[test]
+    fn frames_that_wait_for_the_display_are_left_alone() {
+        let mut guard = RunawayGuard::default();
+        // 240 Hz: each frame took most of the 4.2 ms refresh, so vsync paced it.
+        let took = run_frames(&mut guard, 240, Duration::from_micros(4100), Some(240.0));
+        assert_eq!(took, Duration::from_micros(4100) * 240);
+        assert!(guard.holding_until.is_none());
+    }
+
+    #[test]
+    fn a_few_quick_frames_while_the_queue_fills_are_left_alone() {
+        let mut guard = RunawayGuard::default();
+        let quick = run_frames(&mut guard, 4, Duration::from_micros(300), Some(240.0));
+        assert_eq!(quick, Duration::from_micros(300) * 4);
+        run_frames(&mut guard, 1, Duration::from_micros(4100), Some(240.0));
+        assert_eq!(guard.fast_frames, 0, "a frame that waited starts the count over");
+    }
+
+    #[test]
+    fn a_loop_nothing_paces_is_held_to_the_displays_rate() {
+        let mut guard = RunawayGuard::default();
+        // Nothing waits: 0.4 ms a frame would be 2500 frames a second.
+        let took = run_frames(&mut guard, 600, Duration::from_micros(400), Some(60.0));
+        let fps = 600.0 / took.as_secs_f32();
+        assert!((60.0..75.0).contains(&fps), "{fps} frames a second");
+        // Without a known rate, only a loop that's clearly spinning is held back.
+        let mut guard = RunawayGuard::default();
+        run_frames(&mut guard, 100, Duration::from_millis(3), None);
+        assert!(guard.holding_until.is_none());
+        let took = run_frames(&mut guard, 2500, Duration::from_micros(400), None);
+        assert!(2500.0 / took.as_secs_f32() < 300.0);
+    }
 
     #[test]
     fn frames_arriving_means_not_paused() {
