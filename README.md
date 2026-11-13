@@ -120,7 +120,7 @@ Draw calls are never sent to the GPU directly:
 - Sprites, glyphs and shapes are recorded as 48-byte quad/triangle instances that the vertex shader
   expands, instead of four vertices plus six indices (104 bytes). Consecutive draws that share a
   texture, blend mode, shader and scissor are merged into a single GPU draw call. At the end of the
-  frame everything is uploaded with one `write_buffer` per buffer.
+  frame everything is uploaded through one mapped buffer that's reused from frame to frame.
 - Drawing with the same texture as the previous draw costs one comparison and a `Vec` push; state
   changes are handled on a separate slow path.
 - Shapes sample a white texel inside the glyph atlas, so rectangles, circles and text **batch together**.
