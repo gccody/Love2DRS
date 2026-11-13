@@ -360,9 +360,13 @@ struct App<G, F> {
 
 /// Notices when Android pauses the app without taking its window, as it does
 /// behind a permission dialog. winit keeps that to itself and `suspended` doesn't
-/// fire, but it also holds back redraws until the app resumes. Since every pass of
-/// the loop asks for one, a pass that ends with the last one undelivered means the
-/// app is paused.
+/// fire, but it also holds back redraws until the app resumes. A redraw that was
+/// asked for comes before the loop's next pass, so asking for another with the
+/// last one undelivered means the app is paused.
+///
+/// Only a pass that really asks counts. One that goes back to sleep until a frame
+/// is due (under a frame cap, say) hasn't asked for anything, and the pass after
+/// it finding no frame drawn is no sign of a pause.
 #[cfg(any(target_os = "android", test))]
 #[derive(Default)]
 struct PauseDetector {
@@ -374,7 +378,7 @@ struct PauseDetector {
 impl PauseDetector {
     /// The loop is about to ask for a redraw. Returns whether this is the moment
     /// the app turned out to be paused.
-    fn about_to_wait(&mut self) -> bool {
+    fn asking_for_redraw(&mut self) -> bool {
         let just_paused = self.redraw_requested && !self.paused;
         self.paused |= just_paused;
         self.redraw_requested = true;
@@ -960,19 +964,12 @@ where
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
+        // winit remembers the redraw asked for before the pause and sends it
+        // when the app resumes, so nothing else has to wake this up.
         #[cfg(target_os = "android")]
-        {
-            if self.android_pause.about_to_wait() {
-                log::info!("Android paused the app without taking its window");
-                #[cfg(feature = "audio")]
-                ctx.audio.set_hold(crate::audio::Hold::Paused, true);
-            }
-            // winit remembers the redraw asked for before the pause and sends it
-            // when the app resumes, so nothing else has to wake this up.
-            if self.android_pause.is_paused() {
-                event_loop.set_control_flow(ControlFlow::Wait);
-                return;
-            }
+        if self.android_pause.is_paused() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
         // Nothing is presented while the window is minimized or can't be seen, so
         // vsync no longer paces the loop. Keep the game running, but at a capped
@@ -1017,6 +1014,14 @@ where
             && let Some(due) = self.runaway.next_frame(self.last_frame, now, self.refresh)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            return;
+        }
+        #[cfg(target_os = "android")]
+        if self.android_pause.asking_for_redraw() {
+            log::info!("Android paused the app without taking its window");
+            #[cfg(feature = "audio")]
+            ctx.audio.set_hold(crate::audio::Hold::Paused, true);
+            event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -1077,7 +1082,22 @@ mod tests {
     fn frames_arriving_means_not_paused() {
         let mut d = PauseDetector::default();
         for _ in 0..5 {
-            assert!(!d.about_to_wait());
+            assert!(!d.asking_for_redraw());
+            assert!(!d.frame_drawn());
+            assert!(!d.is_paused());
+        }
+    }
+
+    /// Under a frame cap the loop sleeps between frames without asking for a
+    /// redraw, so several passes go by for each frame. That froze every capped
+    /// game on Android: the second pass found no frame drawn and called it a pause.
+    #[test]
+    fn passes_that_only_wait_for_the_next_frame_are_not_a_pause() {
+        let mut d = PauseDetector::default();
+        for _ in 0..5 {
+            // A pass that sleeps until the frame is due, then one that asks.
+            assert!(!d.is_paused());
+            assert!(!d.asking_for_redraw());
             assert!(!d.frame_drawn());
             assert!(!d.is_paused());
         }
@@ -1086,10 +1106,10 @@ mod tests {
     #[test]
     fn a_redraw_that_never_comes_means_paused_until_the_next_frame() {
         let mut d = PauseDetector::default();
-        assert!(!d.about_to_wait());
-        assert!(d.about_to_wait(), "reported once");
+        assert!(!d.asking_for_redraw());
+        assert!(d.asking_for_redraw(), "reported once");
         assert!(d.is_paused());
-        assert!(!d.about_to_wait(), "reported once");
+        assert!(!d.asking_for_redraw(), "reported once");
         assert!(d.is_paused());
         assert!(d.frame_drawn());
         assert!(!d.is_paused());
@@ -1098,9 +1118,9 @@ mod tests {
     #[test]
     fn losing_the_window_is_not_a_pause() {
         let mut d = PauseDetector::default();
-        d.about_to_wait();
+        d.asking_for_redraw();
         d.forget_redraw();
-        assert!(!d.about_to_wait());
+        assert!(!d.asking_for_redraw());
         assert!(!d.is_paused());
     }
 }
