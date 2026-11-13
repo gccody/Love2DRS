@@ -445,26 +445,33 @@ fn display_pacing(_ctx: &Context, _refresh: Option<f32>) -> Option<f32> {
 
 /// What the loop does between asking for the next frame and being handed it.
 ///
-/// Polling, except on macOS. winit polls there with a timer that repeats every
-/// 0.1 µs and is set only once, so after a frame has waited for the display the
-/// timer is a whole frame behind, and CoreFoundation walks it forward an interval
-/// at a time: some 200,000 steps a frame, which measured as 7% of a core on an M1
-/// at 60 fps, a third of what the main thread used. Asking for a redraw wakes the
-/// loop there by itself, so the loop waits instead, with a timer [`REDRAW_PATIENCE`]
-/// away in case the redraw never comes. A running game moves it on every frame
-/// before it can fire.
-#[cfg(target_os = "macos")]
+/// Polling, except on macOS and iOS, where winit polls with a timer that repeats
+/// every 0.1 µs and the redraw wakes the loop by itself anyway. So there the loop
+/// waits, with a timer [`REDRAW_PATIENCE`] away in case the redraw never comes. A
+/// running game moves it on every frame before it can fire.
+///
+/// On macOS the timer is set only once, so after a frame has waited for the
+/// display it's a whole frame behind, and CoreFoundation walks it forward an
+/// interval at a time: some 200,000 steps a frame, which on an M1 at 60 fps took
+/// the main thread from 8.5% of a core to 10.6%.
+///
+/// On iOS the redraw comes with UIKit's next display update, which a frame paced
+/// by the display asks for [`VSYNC_SLACK`](crate::timer) early. Polling until then
+/// kept the loop spinning for those 3 ms of every frame: 3,000 passes a second for
+/// 60 frames in the simulator, and busy 14 to 20% of the time where the frames
+/// themselves took 6%.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn until_the_redraw(now: Instant) -> ControlFlow {
     ControlFlow::WaitUntil(now + REDRAW_PATIENCE)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn until_the_redraw(_now: Instant) -> ControlFlow {
     ControlFlow::Poll
 }
 
-/// How long macOS is given to deliver a redraw before the loop asks again.
-#[cfg(target_os = "macos")]
+/// How long macOS and iOS are given to deliver a redraw before the loop asks again.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const REDRAW_PATIENCE: Duration = Duration::from_millis(100);
 
 /// Holds the loop to the display's rate when presenting doesn't.
@@ -869,6 +876,10 @@ where
     fn handle_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.frame(event_loop);
+            // UIKit hands out a redraw when it likes, which can be after the loop
+            // has settled down to wait for it. One more pass plans the next frame.
+            #[cfg(target_os = "ios")]
+            event_loop.set_control_flow(ControlFlow::Poll);
             return;
         }
         // Input, or the window changing: show what it did right away.
