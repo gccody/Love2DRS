@@ -561,7 +561,9 @@ fn info_plist(project: &Project, physical: bool, build_info: Option<&BuildInfo>)
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-{build_info}    <key>CFBundleDevelopmentRegion</key>
+{build_info}    <key>CADisableMinimumFrameDurationOnPhone</key>
+    <true/>
+    <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
     <string>{name}</string>
@@ -789,6 +791,9 @@ mod tests {
         assert!(plist.contains("<string>com.example.my-game</string>"));
         assert!(plist.contains("<string>Tom &amp; Jerry</string>"));
         assert!(plist.contains("<string>iPhoneSimulator</string>"));
+        // Without this an iPhone with a 120 Hz screen shows 60 frames a second.
+        assert!(plist.contains("<key>CADisableMinimumFrameDurationOnPhone</key>
+    <true/>"));
         assert!(plist.contains("UIInterfaceOrientationPortrait"));
         assert!(plist.contains("UIInterfaceOrientationLandscapeLeft"));
     }
