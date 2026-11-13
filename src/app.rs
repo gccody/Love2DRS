@@ -209,6 +209,7 @@ where
         suspended: false,
         pad_used: None,
         occluded: false,
+        redraw_asked: false,
         last_draw: Instant::now(),
         draw_next: false,
         refresh: None,
@@ -339,6 +340,9 @@ struct App<G, F> {
     pad_used: Option<Instant>,
     /// The OS says the window can't be seen (macOS and iOS do).
     occluded: bool,
+    /// The loop was asked for the next frame, so its next wakeup is that and not
+    /// something the OS sent.
+    redraw_asked: bool,
     /// When `Game::draw` last ran.
     last_draw: Instant,
     /// Something happened to the window, so the next frame is drawn even if the
@@ -438,6 +442,30 @@ fn display_pacing(ctx: &Context, refresh: Option<f32>) -> Option<f32> {
 fn display_pacing(_ctx: &Context, _refresh: Option<f32>) -> Option<f32> {
     None
 }
+
+/// What the loop does between asking for the next frame and being handed it.
+///
+/// Polling, except on macOS. winit polls there with a timer that repeats every
+/// 0.1 µs and is set only once, so after a frame has waited for the display the
+/// timer is a whole frame behind, and CoreFoundation walks it forward an interval
+/// at a time: some 200,000 steps a frame, which measured as 7% of a core on an M1
+/// at 60 fps, a third of what the main thread used. Asking for a redraw wakes the
+/// loop there by itself, so the loop waits instead, with a timer [`REDRAW_PATIENCE`]
+/// away in case the redraw never comes. A running game moves it on every frame
+/// before it can fire.
+#[cfg(target_os = "macos")]
+fn until_the_redraw(now: Instant) -> ControlFlow {
+    ControlFlow::WaitUntil(now + REDRAW_PATIENCE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn until_the_redraw(_now: Instant) -> ControlFlow {
+    ControlFlow::Poll
+}
+
+/// How long macOS is given to deliver a redraw before the loop asks again.
+#[cfg(target_os = "macos")]
+const REDRAW_PATIENCE: Duration = Duration::from_millis(100);
 
 /// Holds the loop to the display's rate when presenting doesn't.
 ///
@@ -784,7 +812,8 @@ where
     }
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        self.log.woke(matches!(cause, winit::event::StartCause::WaitCancelled { .. }));
+        let for_a_frame = std::mem::take(&mut self.redraw_asked);
+        self.log.woke(!for_a_frame && matches!(cause, winit::event::StartCause::WaitCancelled { .. }));
         #[cfg(target_os = "android")]
         {
             let began = framelog::now();
@@ -1024,8 +1053,9 @@ where
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        event_loop.set_control_flow(ControlFlow::Poll);
+        event_loop.set_control_flow(until_the_redraw(now));
         ctx.window.inner.request_redraw();
+        self.redraw_asked = true;
     }
 }
 
