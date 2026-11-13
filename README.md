@@ -314,6 +314,10 @@ update 0.01, draw 0.05, acquire 3.79, encode 0.06, submit 0.10, present 0.10 | 2
 per frame | gpu ms per pass: 0.142 + 0.120 = 6.3% busy
 ```
 
+Nothing can set an environment variable for an app on a phone, so there an empty file named
+`love2drs-frame-log` in the save directory turns it on too (Android: `adb shell run-as <app id> touch
+files/love2drs-frame-log`). The lines go to logcat on Android and to the system log on iOS.
+
 `acquire` (or `present` on some drivers) is the wait for the display, which isn't counted as busy.
 It's the quickest way to see what a change does to a game's battery use: fewer wakeups, fewer
 passes and less busy time are all less power.

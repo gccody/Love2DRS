@@ -13,7 +13,11 @@
 //! "By the OS" counts waits that a message cut short, such as the mouse moving. The
 //! GPU times need a driver with timestamp queries, and are left out without one.
 //!
-//! Costs nothing when the variable isn't set.
+//! Nothing can set an environment variable for an app on a phone, so there an
+//! empty file named `love2drs-frame-log` in the save directory turns it on too.
+//! The lines go to logcat on Android and to the system log on iOS.
+//!
+//! Costs nothing when it's off.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,7 +64,39 @@ pub(crate) fn gpu_frame(pass_nanos: &[u64]) {
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("LOVE2DRS_FRAME_LOG").is_ok_and(|v| !v.is_empty() && v != "0"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("LOVE2DRS_FRAME_LOG").is_ok_and(|v| !v.is_empty() && v != "0") || asked_for_by_file()
+    })
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn asked_for_by_file() -> bool {
+    crate::filesystem::save_dir().join("love2drs-frame-log").exists()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn asked_for_by_file() -> bool {
+    false
+}
+
+/// Prints a line where it can be read: stderr, which Android sends to logcat. An
+/// iOS app's stderr goes nowhere unless a debugger started it, so there it's the
+/// system log (`log stream`, Console, Xcode).
+#[cfg(not(target_os = "ios"))]
+fn print(line: &str) {
+    eprintln!("{line}");
+}
+
+#[cfg(target_os = "ios")]
+fn print(line: &str) {
+    use objc2_foundation::NSString;
+
+    unsafe extern "C" {
+        fn NSLog(format: *const NSString, ...);
+    }
+    let (format, line) = (NSString::from_str("%@"), NSString::from_str(line));
+    // SAFETY: the format takes one object, which is what follows it.
+    unsafe { NSLog(&*format, &*line as *const NSString) };
 }
 
 /// Runs `f`, counting how long it took as `phase`.
@@ -178,7 +214,7 @@ impl FrameLog {
             let share = gpu.iter().sum::<f64>() * self.frames as f64 / 10.0 / elapsed.as_secs_f64();
             format!(" | gpu ms per pass: {} = {:.1}% busy", passes.join(" + "), share)
         };
-        eprintln!(
+        print(&format!(
             "love2drs: {} frames, {} wakeups ({} by the OS) in {:.2} s, busy {:.1}% | ms per frame: {} | {} passes, {} draws per frame{gpu}",
             self.frames,
             self.wakeups,
@@ -188,7 +224,7 @@ impl FrameLog {
             phases.join(", "),
             self.passes / frames,
             self.draws / frames,
-        );
+        ));
         *self = FrameLog::new();
         self.since = now;
     }
