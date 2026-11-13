@@ -70,6 +70,7 @@ pub mod audio;
 mod conf;
 mod error;
 pub mod filesystem;
+mod framelog;
 pub mod graphics;
 pub mod input;
 pub mod math;

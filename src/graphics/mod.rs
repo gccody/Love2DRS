@@ -38,6 +38,7 @@ use self::renderer::{
     DrawCmd, FrameData, GeomKind, Geometry, Globals, Pass, QUAD_KIND, QuadInstance, Renderer,
     ScreenTarget,
 };
+use crate::framelog::{self, Phase};
 use crate::math::Transform;
 use crate::{Conf, Error, Result};
 
@@ -271,7 +272,12 @@ fn connect(
     let (device, queue) = pollster::block_on(
         adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("love2drs device"),
-            required_features: wgpu::Features::empty(),
+            // Only the frame log wants one, to time the passes on the GPU.
+            required_features: if framelog::enabled() {
+                adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                 .using_resolution(adapter.limits())
                 .using_alignment(adapter.limits()),
@@ -477,7 +483,7 @@ impl Graphics {
         let mut reconfigure = false;
         let mut surface_lost = false;
         if let Some(surface) = self.surface.as_ref().filter(|_| !self.minimized) {
-            match surface.get_current_texture() {
+            match framelog::time(Phase::Acquire, || surface.get_current_texture()) {
                 wgpu::CurrentSurfaceTexture::Success(t) => surface_texture = Some(t),
                 wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                     surface_texture = Some(t);
@@ -491,6 +497,7 @@ impl Graphics {
             }
         }
 
+        let encode_began = framelog::now();
         let mut encoder = self
             .gpu
             .device
@@ -523,7 +530,9 @@ impl Graphics {
         } else {
             self.stats = self.renderer.render(&self.frame, None, &mut encoder);
         }
-        self.gpu.queue.submit([encoder.finish()]);
+        framelog::since(Phase::Encode, encode_began);
+        framelog::time(Phase::Submit, || self.gpu.queue.submit([encoder.finish()]));
+        self.renderer.submitted();
         if let Some(((buffer, padded_row), path)) = readback
             && let Err(e) = self.save_screenshot(&buffer, padded_row, &path)
         {
@@ -531,7 +540,7 @@ impl Graphics {
         }
         let surface_texture_presented = surface_texture.is_some();
         if let Some(st) = surface_texture {
-            self.gpu.queue.present(st);
+            framelog::time(Phase::Present, || self.gpu.queue.present(st));
         }
         if reconfigure {
             self.configure_surface();

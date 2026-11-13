@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::Color;
 use super::image::{Gpu, IMAGE_FORMAT, Image};
@@ -322,8 +323,121 @@ impl GrowBuffer {
     }
 }
 
+/// How many of a frame's passes [`GpuTimer`] times.
+const TIMED_PASSES: u32 = crate::framelog::GPU_PASSES as u32;
+const TIMER_FREE: u8 = 0;
+const TIMER_FILLED: u8 = 1;
+const TIMER_MAPPING: u8 = 2;
+const TIMER_READY: u8 = 3;
+
+/// Times each render pass on the GPU, for `LOVE2DRS_FRAME_LOG`. The answers come
+/// back a few frames later, through whichever readback buffer is free.
+struct GpuTimer {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: Vec<TimerReadback>,
+    /// Nanoseconds per timestamp tick.
+    period: f32,
+}
+
+struct TimerReadback {
+    buffer: wgpu::Buffer,
+    state: Arc<AtomicU8>,
+    passes: u32,
+}
+
+impl GpuTimer {
+    fn new(gpu: &Gpu) -> Option<Self> {
+        if !crate::framelog::enabled() || !gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let size = TIMED_PASSES as u64 * 16;
+        let buffer = |label, usage| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        Some(GpuTimer {
+            queries: gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("love2drs pass times"),
+                ty: wgpu::QueryType::Timestamp,
+                count: TIMED_PASSES * 2,
+            }),
+            resolve: buffer(
+                "love2drs pass times",
+                wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            ),
+            readback: (0..4)
+                .map(|_| TimerReadback {
+                    buffer: buffer(
+                        "love2drs pass times readback",
+                        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    ),
+                    state: Arc::new(AtomicU8::new(TIMER_FREE)),
+                    passes: 0,
+                })
+                .collect(),
+            period: gpu.queue.get_timestamp_period(),
+        })
+    }
+
+    /// Hands finished timings to the frame log.
+    fn collect(&mut self, gpu: &Gpu) {
+        let _ = gpu.device.poll(wgpu::PollType::Poll);
+        for r in &mut self.readback {
+            if r.state.load(Ordering::Acquire) != TIMER_READY {
+                continue;
+            }
+            if let Ok(view) = r.buffer.slice(..).get_mapped_range() {
+                let ticks: &[u64] = bytemuck::cast_slice(&view[..r.passes as usize * 16]);
+                let nanos: Vec<u64> = ticks
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[begin, end]| (end.saturating_sub(*begin) as f64 * self.period as f64) as u64)
+                    .collect();
+                crate::framelog::gpu_frame(&nanos);
+            }
+            r.buffer.unmap();
+            r.state.store(TIMER_FREE, Ordering::Release);
+        }
+    }
+
+    /// Copies this frame's timestamps to a free readback buffer, if there is one.
+    fn resolve(&mut self, passes: u32, encoder: &mut wgpu::CommandEncoder) {
+        let Some(r) = self.readback.iter_mut().find(|r| r.state.load(Ordering::Acquire) == TIMER_FREE) else {
+            return;
+        };
+        if passes == 0 {
+            return;
+        }
+        encoder.resolve_query_set(&self.queries, 0..passes * 2, &self.resolve, 0);
+        encoder.copy_buffer_to_buffer(&self.resolve, 0, &r.buffer, 0, passes as u64 * 16);
+        r.passes = passes;
+        r.state.store(TIMER_FILLED, Ordering::Release);
+    }
+
+    /// Asks for the buffers filled by commands that have now been submitted.
+    fn submitted(&mut self) {
+        for r in &self.readback {
+            if r.state.load(Ordering::Acquire) != TIMER_FILLED {
+                continue;
+            }
+            r.state.store(TIMER_MAPPING, Ordering::Release);
+            let state = r.state.clone();
+            r.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                state.store(if result.is_ok() { TIMER_READY } else { TIMER_FREE }, Ordering::Release);
+            });
+        }
+    }
+}
+
 pub(crate) struct Renderer {
     gpu: Arc<Gpu>,
+    timer: Option<GpuTimer>,
     uniform_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     default_module: wgpu::ShaderModule,
@@ -334,6 +448,44 @@ pub(crate) struct Renderer {
     uniform_buffer: GrowBuffer,
     uniform_bind_group: wgpu::BindGroup,
     pub uniform_align: u32,
+    /// Scratch for [`plan_clears`], kept so a frame doesn't allocate.
+    clears: Vec<PassClear>,
+}
+
+/// What a recorded pass turns into: left out, or run with this clear color.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PassClear {
+    Skip,
+    Run(Option<Color>),
+}
+
+/// Works out each pass's clear, folding a screen pass that only clears into the
+/// next one that draws to the screen.
+///
+/// A frame starts by clearing the screen, and a game that draws into canvases
+/// first only comes back to the screen afterwards. Recorded as it happened, that's
+/// a pass that clears the screen and a later one that loads it back to draw on.
+/// On a phone's GPU each costs a trip through the whole framebuffer, where one
+/// pass that starts cleared costs neither. Nothing can read the screen in
+/// between, so moving the clear is safe. Canvases can be read, so theirs stay put.
+fn plan_clears(passes: &[Pass], cmd_count: usize, plan: &mut Vec<PassClear>) {
+    plan.clear();
+    plan.extend(passes.iter().map(|p| PassClear::Run(p.clear)));
+    for i in 0..passes.len() {
+        let end = passes.get(i + 1).map_or(cmd_count, |p| p.cmd_start);
+        let PassClear::Run(Some(clear)) = plan[i] else {
+            continue;
+        };
+        if passes[i].target.is_some() || passes[i].cmd_start != end {
+            continue;
+        }
+        if let Some(next) = (i + 1..passes.len()).find(|&j| passes[j].target.is_none()) {
+            plan[i] = PassClear::Skip;
+            if plan[next] == PassClear::Run(None) {
+                plan[next] = PassClear::Run(Some(clear));
+            }
+        }
+    }
 }
 
 impl Renderer {
@@ -401,6 +553,7 @@ impl Renderer {
         let uniform_bind_group =
             Self::make_uniform_bind_group(device, &uniform_layout, &uniform_buffer.buffer);
         Renderer {
+            timer: GpuTimer::new(&gpu),
             gpu,
             uniform_layout,
             pipeline_layout,
@@ -412,6 +565,7 @@ impl Renderer {
             uniform_buffer,
             uniform_bind_group,
             uniform_align,
+            clears: Vec::new(),
         }
     }
 
@@ -544,6 +698,9 @@ impl Renderer {
                 - frame.triangle_instances,
             ..Default::default()
         };
+        if let Some(timer) = &mut self.timer {
+            timer.collect(&self.gpu);
+        }
 
         self.instance_buffer
             .upload(&self.gpu, bytemuck::cast_slice(&frame.quads));
@@ -591,12 +748,17 @@ impl Renderer {
             }
         }
 
+        let mut clears = std::mem::take(&mut self.clears);
+        plan_clears(&frame.passes, frame.cmds.len(), &mut clears);
         for (i, pass) in frame.passes.iter().enumerate() {
             let Some((format, samples)) = target_info(pass) else {
                 continue;
             };
             let range = pass_range(i);
-            if range.is_empty() && pass.clear.is_none() {
+            let PassClear::Run(clear) = clears[i] else {
+                continue;
+            };
+            if range.is_empty() && clear.is_none() {
                 continue;
             }
             let (view, resolve, size) = match (&pass.target, screen) {
@@ -604,7 +766,7 @@ impl Renderer {
                 (None, Some(s)) => (s.view, s.resolve, s.size),
                 (None, None) => continue,
             };
-            let load = match pass.clear {
+            let load = match clear {
                 Some(c) => wgpu::LoadOp::Clear(c.to_wgpu()),
                 None => wgpu::LoadOp::Load,
             };
@@ -620,7 +782,13 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.timer.as_ref().filter(|_| stats.passes < TIMED_PASSES).map(|t| {
+                    wgpu::RenderPassTimestampWrites {
+                        query_set: &t.queries,
+                        beginning_of_pass_write_index: Some(stats.passes * 2),
+                        end_of_pass_write_index: Some(stats.passes * 2 + 1),
+                    }
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -699,9 +867,20 @@ impl Renderer {
                 stats.draw_calls += 1;
             }
         }
+        self.clears = clears;
         // Triangle instances were counted as two triangles above.
         stats.triangles = stats.triangles.saturating_sub(frame.triangle_instances);
+        if let Some(timer) = &mut self.timer {
+            timer.resolve(stats.passes.min(TIMED_PASSES), encoder);
+        }
         stats
+    }
+
+    /// The commands recorded by [`Renderer::render`] were handed to the GPU.
+    pub fn submitted(&mut self) {
+        if let Some(timer) = &mut self.timer {
+            timer.submitted();
+        }
     }
 }
 
@@ -732,6 +911,47 @@ fn clamp_scissor(scissor: Option<[i32; 4]>, (w, h): (u32, u32)) -> [u32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pass(clear: Option<Color>, cmd_start: usize) -> Pass {
+        Pass {
+            target: None,
+            clear,
+            cmd_start,
+        }
+    }
+
+    fn planned(passes: &[Pass], cmds: usize) -> Vec<PassClear> {
+        let mut plan = Vec::new();
+        plan_clears(passes, cmds, &mut plan);
+        plan
+    }
+
+    #[test]
+    fn a_screen_pass_that_only_clears_joins_the_next_one() {
+        let red = Some(Color::rgb(1.0, 0.0, 0.0));
+        // Clear, (canvas work recorded elsewhere), then drawing on the screen.
+        let plan = planned(&[pass(red, 0), pass(None, 0)], 3);
+        assert_eq!(plan, vec![PassClear::Skip, PassClear::Run(red)]);
+        // A chain of them leaves one pass.
+        let plan = planned(&[pass(red, 0), pass(None, 0), pass(None, 0)], 2);
+        assert_eq!(plan, vec![PassClear::Skip, PassClear::Skip, PassClear::Run(red)]);
+    }
+
+    #[test]
+    fn a_later_clear_wins_and_drawing_keeps_its_pass() {
+        let (red, blue) = (Some(Color::rgb(1.0, 0.0, 0.0)), Some(Color::rgb(0.0, 0.0, 1.0)));
+        assert_eq!(
+            planned(&[pass(red, 0), pass(blue, 0)], 1),
+            vec![PassClear::Skip, PassClear::Run(blue)]
+        );
+        // The first pass drew something, so it has to run as recorded.
+        assert_eq!(
+            planned(&[pass(red, 0), pass(None, 2)], 4),
+            vec![PassClear::Run(red), PassClear::Run(None)]
+        );
+        // Nothing follows on the screen: the clear still has to happen.
+        assert_eq!(planned(&[pass(red, 0)], 0), vec![PassClear::Run(red)]);
+    }
 
     #[test]
     fn quad_instance_layout_matches_attributes() {

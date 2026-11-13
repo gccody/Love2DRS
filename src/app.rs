@@ -7,6 +7,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
+use crate::framelog::{self, FrameLog, Phase};
 use crate::graphics::Graphics;
 use crate::input::gamepad::GamepadEvent;
 use crate::input::touch::{MouseAction, MouseFinger};
@@ -193,6 +194,9 @@ where
         builder.with_android_app(crate::platform::android_app().clone());
     }
     let event_loop = builder.build().map_err(|e| Error::Window(e.to_string()))?;
+    // Raw mouse and keyboard reports, which nothing here reads. A gaming mouse sends
+    // a thousand a second, and each one would wake the loop up.
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::<G, F> {
         conf,
@@ -203,7 +207,9 @@ where
         last_frame: Instant::now(),
         wake: false,
         suspended: false,
+        pad_used: None,
         mouse_finger: MouseFinger::default(),
+        log: FrameLog::new(),
         #[cfg(target_os = "android")]
         android_input: Default::default(),
         #[cfg(target_os = "android")]
@@ -253,15 +259,28 @@ fn key_event<G: Game>(
     }
 }
 
-/// Reads controller events and replays them as `Game` callbacks. Returns
-/// whether there were any.
-fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) -> bool {
+/// What [`poll_gamepads`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PadNews {
+    Nothing,
+    /// A controller came or went, which isn't the player using one.
+    Changed,
+    /// A button or stick moved.
+    Used,
+}
+
+/// Reads controller events and replays them as `Game` callbacks.
+fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) -> PadNews {
     ctx.gamepad.poll();
     if ctx.gamepad.events.is_empty() {
-        return false;
+        return PadNews::Nothing;
     }
+    let mut news = PadNews::Changed;
     let mut events = std::mem::take(&mut ctx.gamepad.events);
     for ev in events.drain(..) {
+        if !matches!(ev, GamepadEvent::Added(_) | GamepadEvent::Removed(_)) {
+            news = PadNews::Used;
+        }
         match ev {
             GamepadEvent::Added(id) => game.gamepad_added(ctx, id),
             GamepadEvent::Removed(id) => game.gamepad_removed(ctx, id),
@@ -274,7 +293,7 @@ fn poll_gamepads<G: Game>(ctx: &mut Context, game: &mut G) -> bool {
     if ctx.gamepad.events.is_empty() {
         ctx.gamepad.events = events;
     }
-    true
+    news
 }
 
 /// Testing aid:`LOVE2DRS_SCREENSHOT=out.png` saves frame
@@ -310,8 +329,12 @@ struct App<G, F> {
     wake: bool,
     /// The app is in the background, so nothing may be drawn.
     suspended: bool,
+    /// When a controller last did something.
+    pad_used: Option<Instant>,
     /// The finger that acts as the mouse on mobile.
     mouse_finger: MouseFinger,
+    /// `LOVE2DRS_FRAME_LOG`: where the loop's time goes.
+    log: FrameLog,
     #[cfg(target_os = "android")]
     android_input: crate::input::android::Reader,
     #[cfg(target_os = "android")]
@@ -362,6 +385,14 @@ const MINIMIZED_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// Controllers don't wake the event loop, so while a frame cap has it asleep
 /// they're looked at this often.
 const PAD_POLL_TIME: Duration = Duration::from_millis(16);
+/// But only while one is in use. A controller nobody has touched for this long is
+/// looked at less often, as waking up 60 times a second for it would undo much of
+/// what the cap saves. Plenty of PCs have a device that calls itself a controller
+/// and never sends a thing.
+const PAD_IN_USE_TIME: Duration = Duration::from_secs(60);
+/// How often a controller that isn't in use is looked at, which is the longest
+/// its first press can take to be noticed.
+const IDLE_PAD_POLL_TIME: Duration = Duration::from_millis(50);
 
 /// The display's refresh rate, when the loop should wait for the next refresh
 /// even without a frame cap. Only on iOS: winit's `ControlFlow::Poll` there
@@ -449,28 +480,32 @@ where
             return;
         };
         self.last_frame = Instant::now();
+        ctx.timer.frame_started(self.last_frame);
         #[cfg(target_os = "android")]
         if self.android_pause.frame_drawn() {
             log::info!("Android resumed the app");
             #[cfg(feature = "audio")]
             ctx.audio.set_hold(crate::audio::Hold::Paused, false);
         }
-        poll_gamepads(ctx, game);
+        if framelog::time(Phase::Input, || poll_gamepads(ctx, game)) == PadNews::Used {
+            self.pad_used = Some(self.last_frame);
+        }
         let dt = ctx.timer.step();
-        game.update(ctx, dt);
+        framelog::time(Phase::Update, || game.update(ctx, dt));
         ctx.keyboard.end_frame();
         ctx.mouse.end_frame();
         ctx.gamepad.end_frame();
         ctx.touch.end_frame();
 
         ctx.graphics.begin_frame();
-        game.draw(ctx);
+        framelog::time(Phase::Draw, || game.draw(ctx));
         if let Some(path) = &self.autoshot.path
             && ctx.timer.frame_count() == self.autoshot.frame
         {
             ctx.graphics.capture_screenshot(path.clone());
         }
         ctx.graphics.end_frame();
+        self.log.frame(ctx.graphics.stats());
         if ctx.graphics.take_out_of_memory() {
             game.low_memory(ctx);
         }
@@ -659,9 +694,15 @@ where
         }
     }
 
-    #[cfg(target_os = "android")]
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
-        self.read_android_input(event_loop);
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        self.log.woke(matches!(cause, winit::event::StartCause::WaitCancelled { .. }));
+        #[cfg(target_os = "android")]
+        {
+            let began = framelog::now();
+            self.read_android_input(event_loop);
+            self.log.done(began);
+        }
+        let _ = event_loop;
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -689,6 +730,25 @@ where
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let began = framelog::now();
+        self.handle_window_event(event_loop, event);
+        self.log.done(began);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let began = framelog::now();
+        self.plan_next_frame(event_loop);
+        self.log.done(began);
+        self.log.sleeping();
+    }
+}
+
+impl<G, F> App<G, F>
+where
+    G: Game,
+    F: FnOnce(&mut Context) -> Result<G>,
+{
+    fn handle_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.frame(event_loop);
             return;
@@ -801,7 +861,8 @@ where
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    /// Decides when the loop runs next: at once, or after a sleep.
+    fn plan_next_frame(&mut self, event_loop: &ActiveEventLoop) {
         let Some((ctx, game)) = &mut self.state else {
             return;
         };
@@ -841,8 +902,18 @@ where
             && let Some(due) = ctx.timer.next_frame(self.last_frame, now, display_pacing(ctx))
         {
             let has_pads = ctx.gamepad.ids().next().is_some();
-            if !(has_pads && poll_gamepads(ctx, game)) {
-                let wake_at = if has_pads { due.min(now + PAD_POLL_TIME) } else { due };
+            let news = if has_pads { poll_gamepads(ctx, game) } else { PadNews::Nothing };
+            if news == PadNews::Used {
+                self.pad_used = Some(now);
+            }
+            // Anything from a controller gets a frame at once, like any other input.
+            if news == PadNews::Nothing {
+                let in_use = self.pad_used.is_some_and(|at| now - at < PAD_IN_USE_TIME);
+                let wake_at = match (has_pads, in_use) {
+                    (true, true) => due.min(now + PAD_POLL_TIME),
+                    (true, false) => due.min(now + IDLE_PAD_POLL_TIME),
+                    (false, _) => due,
+                };
                 event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
                 return;
             }

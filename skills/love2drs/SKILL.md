@@ -260,5 +260,9 @@ When a game should run on phones:
   that frame as a PNG and exits. Open the PNG to confirm the game renders what you intended. This
   needs a GPU and a display session.
 - Inside game code, `ctx.graphics.capture_screenshot("shot.png")` saves the current frame.
+- **Where the time goes**: run with `LOVE2DRS_FRAME_LOG=1` for a line a second on stderr with the
+  frames drawn, loop wakeups, how busy the main thread was, milliseconds per part of a frame,
+  render passes and draw calls, and the GPU's time per pass. Use it to check a performance or
+  battery change instead of guessing.
 - `ctx.graphics.stats()` reports draw calls, passes, vertices and triangles for the previous frame.
   Use it to spot broken batching.

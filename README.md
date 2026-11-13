@@ -296,6 +296,22 @@ Set `LOVE2DRS_SCREENSHOT=out.png` (and optionally `LOVE2DRS_SCREENSHOT_FRAME=60`
 love2drs game save that frame as a PNG and exit. This is useful for CI smoke tests. All the screenshots
 above were captured this way. In game code, call `ctx.graphics.capture_screenshot("shot.png")`.
 
+## Where the time goes
+
+Set `LOVE2DRS_FRAME_LOG=1` and any love2drs game prints a line a second to stderr: how many frames
+it drew, how often the loop woke up, how busy the main thread was, the milliseconds each part of a
+frame took, and the GPU's time for each render pass (where the driver can time them).
+
+```text
+love2drs: 240 frames, 240 wakeups (0 by the OS) in 1.00 s, busy 5.4% | ms per frame: input 0.00,
+update 0.01, draw 0.05, acquire 3.79, encode 0.06, submit 0.10, present 0.10 | 2 passes, 28 draws
+per frame | gpu ms per pass: 0.142 + 0.120 = 6.3% busy
+```
+
+`acquire` (or `present` on some drivers) is the wait for the display, which isn't counted as busy.
+It's the quickest way to see what a change does to a game's battery use: fewer wakeups, fewer
+passes and less busy time are all less power.
+
 ## Agent skill
 
 The repo includes an [Agent Skill](skills/love2drs/SKILL.md) that teaches coding agents the love2drs API,
