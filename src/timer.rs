@@ -21,10 +21,6 @@ pub struct Timer {
     slot: Option<Instant>,
 }
 
-/// How much earlier than the display's refresh a frame paced by it starts, so
-/// it's ready for the refresh it's meant for rather than just missing it.
-const VSYNC_SLACK: Duration = Duration::from_millis(3);
-
 impl Timer {
     pub(crate) fn new(max_dt: f32) -> Self {
         let now = Instant::now();
@@ -56,18 +52,17 @@ impl Timer {
     }
 
     /// When the frame after one that started at `last` may start, or `None`
-    /// when it may start right away. `refresh` is the display's rate, for a loop
-    /// that should wait for its next refresh even without a cap.
-    pub(crate) fn next_frame(&self, last: Instant, now: Instant, refresh: Option<f32>) -> Option<Instant> {
-        let due = match (self.max_fps, refresh) {
-            // A cap below the display's rate sets the pace.
-            (Some(cap), refresh) if refresh.is_none_or(|refresh| cap < refresh) => {
-                self.slot.unwrap_or(last) + Duration::from_secs_f32(1.0 / cap)
-            }
-            (_, Some(refresh)) => last + Duration::from_secs_f32(1.0 / refresh).saturating_sub(VSYNC_SLACK),
-            (_, None) => return None,
-        };
+    /// when it may start right away, as it always may without a cap.
+    pub(crate) fn next_frame(&self, last: Instant, now: Instant) -> Option<Instant> {
+        let due = self.slot.unwrap_or(last) + Duration::from_secs_f32(1.0 / self.max_fps?);
         (now < due).then_some(due)
+    }
+
+    /// Whether the cap, and not a display refreshing `refresh` times a second,
+    /// is what limits the frame rate.
+    #[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+    pub(crate) fn capped_below(&self, refresh: Option<f32>) -> bool {
+        self.max_fps.is_some_and(|cap| refresh.is_none_or(|refresh| cap < refresh))
     }
 
     /// Advances to a new frame and returns the clamped delta time.
@@ -140,20 +135,21 @@ mod tests {
     fn no_cap_means_draw_now() {
         let t = Timer::new(0.25);
         let now = Instant::now();
-        assert_eq!(t.next_frame(now, now, None), None);
+        assert_eq!(t.next_frame(now, now), None);
     }
 
     #[test]
-    fn the_display_paces_an_uncapped_loop() {
+    fn only_a_cap_below_the_displays_rate_sets_the_pace() {
         let mut t = Timer::new(0.25);
-        let last = Instant::now();
-        let wait = (t.next_frame(last, last, Some(60.0)).unwrap() - last).as_secs_f32();
-        assert!((wait - (1.0 / 60.0 - 0.003)).abs() < 1e-4, "waits {wait} s");
-        // A cap below the display's rate wins, one above it doesn't.
+        assert!(!t.capped_below(Some(60.0)));
+        assert!(!t.capped_below(None));
         t.set_max_fps(Some(20.0));
-        assert!(t.next_frame(last, last, Some(60.0)).unwrap() - last > Duration::from_millis(40));
+        assert!(t.capped_below(Some(60.0)));
+        assert!(t.capped_below(None), "a display of unknown speed doesn't pace anything");
+        t.set_max_fps(Some(60.0));
+        assert!(!t.capped_below(Some(60.0)));
         t.set_max_fps(Some(240.0));
-        assert!(t.next_frame(last, last, Some(60.0)).unwrap() - last > Duration::from_millis(13));
+        assert!(!t.capped_below(Some(120.0)));
     }
 
     #[test]
@@ -162,12 +158,12 @@ mod tests {
         t.set_max_fps(Some(20.0));
         let last = Instant::now();
         t.frame_started(last);
-        let due = t.next_frame(last, last, None).expect("the next frame isn't due yet");
+        let due = t.next_frame(last, last).expect("the next frame isn't due yet");
         let wait = (due - last).as_secs_f32();
         assert!((wait - 0.05).abs() < 1e-4, "waits {wait} s");
         // Due, then late: draw now.
-        assert_eq!(t.next_frame(last, due, None), None);
-        assert_eq!(t.next_frame(last, last + Duration::from_secs(1), None), None);
+        assert_eq!(t.next_frame(last, due), None);
+        assert_eq!(t.next_frame(last, last + Duration::from_secs(1)), None);
     }
 
     #[test]
@@ -180,7 +176,7 @@ mod tests {
         t.frame_started(now);
         for _ in 0..20 {
             // Every sleep ends 2 ms after the frame was due.
-            now = t.next_frame(now, now, None).unwrap() + late;
+            now = t.next_frame(now, now).unwrap() + late;
             t.frame_started(now);
         }
         let took = (now - start).as_secs_f32();
@@ -196,11 +192,11 @@ mod tests {
         // Input ran a frame 10 ms in: the next one is a full interval after it.
         let early = start + Duration::from_millis(10);
         t.frame_started(early);
-        assert_eq!(t.next_frame(early, early, None), Some(early + Duration::from_secs_f32(0.05)));
+        assert_eq!(t.next_frame(early, early), Some(early + Duration::from_secs_f32(0.05)));
         // A frame that took a long time doesn't leave a backlog to catch up on.
         let late = early + Duration::from_millis(400);
         t.frame_started(late);
-        assert_eq!(t.next_frame(late, late, None), Some(late + Duration::from_secs_f32(0.05)));
+        assert_eq!(t.next_frame(late, late), Some(late + Duration::from_secs_f32(0.05)));
     }
 
     #[test]

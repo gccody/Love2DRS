@@ -185,7 +185,8 @@ lists every option. Apps are written to `target/love2drs/`.
   love2drs uses a [winit fork](https://github.com/molenick/winit/tree/uiscene-minimal-v0.30) for this until winit
   supports UIScene, so use `love2drs::winit` instead of adding your own `winit` dependency.
   An iPhone with a 120 Hz screen holds apps to 60 frames a second unless `Info.plist` sets
-  `CADisableMinimumFrameDurationOnPhone`, which `cargo-love2drs` does (reinstall it to pick that up).
+  `CADisableMinimumFrameDurationOnPhone`, which `cargo-love2drs` does (reinstall it to pick that up), and the
+  app asks for the faster rate, which love2drs does: its frames there come from a display link.
 
 **App settings** go in your game's `Cargo.toml`. All of them are optional:
 

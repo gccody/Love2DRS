@@ -43,13 +43,121 @@ macro_rules! android_main {
 }
 
 #[cfg(target_os = "ios")]
-pub(crate) use ios::SceneWindow;
+pub(crate) use ios::{FrameLink, SceneWindow};
 
 #[cfg(target_os = "ios")]
 mod ios {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use objc2::encode::{Encode, Encoding};
     use objc2::rc::{Allocated, Retained};
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
+    use objc2::runtime::{AnyObject, NSObject};
+    use objc2::{ClassType, class, define_class, msg_send, sel};
+    use objc2_foundation::NSString;
+
+    /// Set by the display link when the display is about to refresh.
+    static TICKED: AtomicBool = AtomicBool::new(false);
+
+    define_class!(
+        // SAFETY: `NSObject` asks nothing of its subclasses, and this one has no `Drop`.
+        #[unsafe(super(NSObject))]
+        #[name = "Love2drsFrameLinkTarget"]
+        struct LinkTarget;
+
+        impl LinkTarget {
+            #[unsafe(method(tick:))]
+            fn tick(&self, _link: &AnyObject) {
+                TICKED.store(true, Ordering::Relaxed);
+            }
+        }
+    );
+
+    /// `CAFrameRateRange`.
+    #[repr(C)]
+    struct FrameRateRange {
+        minimum: f32,
+        maximum: f32,
+        preferred: f32,
+    }
+
+    // SAFETY: Three floats, under the name Core Animation gives the struct.
+    unsafe impl Encode for FrameRateRange {
+        const ENCODING: Encoding =
+            Encoding::Struct("CAFrameRateRange", &[f32::ENCODING, f32::ENCODING, f32::ENCODING]);
+    }
+
+    /// A `CADisplayLink`: wakes the event loop once for every refresh of the
+    /// display, and tells iOS how fast the game wants it refreshed.
+    ///
+    /// That second part is the only way to be shown more than 60 frames a second.
+    /// A display that can do 120 runs at 60 or less until a display link asks for
+    /// more, however fast the app presents. (An iPhone also needs
+    /// `CADisableMinimumFrameDurationOnPhone` in its Info.plist, which `cargo
+    /// love2drs` writes.)
+    pub(crate) struct FrameLink {
+        link: Retained<AnyObject>,
+        running: bool,
+        rate: f32,
+    }
+
+    impl FrameLink {
+        /// Starts out paused. Call on the main thread.
+        pub(crate) fn new() -> Self {
+            unsafe extern "C" {
+                static NSRunLoopCommonModes: &'static NSString;
+            }
+            // SAFETY: The event loop calls this on the main thread, and these are
+            // QuartzCore's and Foundation's documented signatures. The link keeps
+            // its target alive.
+            let link = unsafe {
+                let target: Retained<LinkTarget> = msg_send![LinkTarget::class(), new];
+                let link: Retained<AnyObject> =
+                    msg_send![class!(CADisplayLink), displayLinkWithTarget: &*target, selector: sel!(tick:)];
+                let _: () = msg_send![&*link, setPaused: true];
+                let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
+                let _: () = msg_send![&*link, addToRunLoop: run_loop, forMode: NSRunLoopCommonModes];
+                link
+            };
+            FrameLink { link, running: false, rate: 0.0 }
+        }
+
+        /// Ticks at the display's rate of `rate` frames a second from now on.
+        pub(crate) fn run(&mut self, rate: f32) {
+            if self.rate != rate {
+                self.rate = rate;
+                // What Apple suggests for a game: the full rate, and no less than
+                // two thirds of it when the system has to hold back (80 of 120).
+                let range = FrameRateRange { minimum: rate * 2.0 / 3.0, maximum: rate, preferred: rate };
+                // SAFETY: iOS 15's signature, which is the oldest iOS this builds for.
+                let _: () = unsafe { msg_send![&*self.link, setPreferredFrameRateRange: range] };
+            }
+            if !std::mem::replace(&mut self.running, true) {
+                TICKED.store(false, Ordering::Relaxed);
+                // SAFETY: A `BOOL` property.
+                let _: () = unsafe { msg_send![&*self.link, setPaused: false] };
+            }
+        }
+
+        /// Stops the ticks, and with them the request for a fast display.
+        pub(crate) fn pause(&mut self) {
+            if std::mem::take(&mut self.running) {
+                // SAFETY: A `BOOL` property.
+                let _: () = unsafe { msg_send![&*self.link, setPaused: true] };
+            }
+        }
+
+        /// Whether the display has refreshed since this was last asked, while running.
+        pub(crate) fn take_tick(&self) -> bool {
+            TICKED.swap(false, Ordering::Relaxed) && self.running
+        }
+    }
+
+    impl Drop for FrameLink {
+        fn drop(&mut self) {
+            // SAFETY: Takes the link off the run loop, which lets go of the target.
+            let _: () = unsafe { msg_send![&*self.link, invalidate] };
+        }
+    }
 
     /// A window that's key only while winit makes the real one.
     ///

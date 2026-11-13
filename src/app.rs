@@ -214,6 +214,7 @@ where
         draw_next: false,
         refresh: None,
         refresh_checked: None,
+        pacer: DisplayPacer::default(),
         runaway: RunawayGuard::default(),
         mouse_finger: MouseFinger::default(),
         log: FrameLog::new(),
@@ -351,6 +352,7 @@ struct App<G, F> {
     /// The display's refresh rate, and when it was asked for.
     refresh: Option<f32>,
     refresh_checked: Option<Instant>,
+    pacer: DisplayPacer,
     runaway: RunawayGuard,
     /// The finger that acts as the mouse on mobile.
     mouse_finger: MouseFinger,
@@ -427,40 +429,65 @@ const PAD_IN_USE_TIME: Duration = Duration::from_secs(60);
 /// its first press can take to be noticed.
 const IDLE_PAD_POLL_TIME: Duration = Duration::from_millis(50);
 
-/// The display's refresh rate, when the loop should wait for the next refresh
-/// even without a frame cap. Only on iOS: winit's `ControlFlow::Poll` there
-/// fires the run loop again at once, so the main thread spun between frames and
-/// kept a whole core busy (measured on an iPhone: 98% CPU at 60 fps, and 100
-/// times fewer instructions once it waited). Elsewhere presenting a frame already
-/// waits for vsync, and coarse timers would make an extra wait miss refreshes.
-#[cfg(target_os = "ios")]
-fn display_pacing(ctx: &Context, refresh: Option<f32>) -> Option<f32> {
-    ctx.graphics.vsync().then_some(refresh.unwrap_or(60.0))
+/// Frames that start when the display is about to refresh. Only iOS has them.
+///
+/// Everywhere else the loop asks winit for a redraw and presenting the frame
+/// waits for the display. On iOS a redraw is UIKit drawing the view, and that
+/// costs three things:
+///
+/// - UIKit draws 60 times a second at most, so a 120 Hz iPhone showed 60 frames.
+///   Only a display link that asks for more gets the display to refresh faster.
+/// - The redraw comes with UIKit's next update, whenever that is, so each frame
+///   took three passes of the loop: ask, be drawn, plan the next one.
+/// - To be drawn, the view gets a bitmap its own size, which the game never
+///   uses: its frames go to a Metal layer on top.
+///
+/// So on iOS the frames come from a [`FrameLink`](crate::platform::FrameLink),
+/// one pass of the loop each, and the loop draws them itself. A frame cap below
+/// the display's rate pauses the link, which also lets the display slow down, and
+/// those frames come from a timer.
+#[derive(Default)]
+struct DisplayPacer {
+    #[cfg(target_os = "ios")]
+    link: Option<crate::platform::FrameLink>,
 }
 
-#[cfg(not(target_os = "ios"))]
-fn display_pacing(_ctx: &Context, _refresh: Option<f32>) -> Option<f32> {
-    None
+impl DisplayPacer {
+    /// Asks for a frame at every refresh of a display that does `rate` a second.
+    #[cfg(target_os = "ios")]
+    fn run(&mut self, rate: f32) {
+        self.link.get_or_insert_with(crate::platform::FrameLink::new).run(rate);
+    }
+
+    /// No frames until it's asked for them again.
+    fn pause(&mut self) {
+        #[cfg(target_os = "ios")]
+        if let Some(link) = &mut self.link {
+            link.pause();
+        }
+    }
+
+    /// Whether the display is about to refresh, so a frame is due.
+    fn take_tick(&self) -> bool {
+        #[cfg(target_os = "ios")]
+        return self.link.as_ref().is_some_and(|link| link.take_tick());
+        #[cfg(not(target_os = "ios"))]
+        false
+    }
 }
 
 /// What the loop does between asking for the next frame and being handed it.
 ///
-/// Polling, except on macOS and iOS, where winit polls with a timer that repeats
-/// every 0.1 µs and the redraw wakes the loop by itself anyway. So there the loop
+/// Polling, except on macOS, where winit polls with a timer that repeats every
+/// 0.1 µs and the redraw wakes the loop by itself anyway. So there the loop
 /// waits, with a timer [`REDRAW_PATIENCE`] away in case the redraw never comes. A
 /// running game moves it on every frame before it can fire.
 ///
-/// On macOS the timer is set only once, so after a frame has waited for the
-/// display it's a whole frame behind, and CoreFoundation walks it forward an
-/// interval at a time: some 200,000 steps a frame, which on an M1 at 60 fps took
-/// the main thread from 8.5% of a core to 10.6%.
-///
-/// On iOS the redraw comes with UIKit's next display update, which a frame paced
-/// by the display asks for [`VSYNC_SLACK`](crate::timer) early. Polling until then
-/// kept the loop spinning for those 3 ms of every frame: 3,000 passes a second for
-/// 60 frames in the simulator, and busy 14 to 20% of the time where the frames
-/// themselves took 6%.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// That timer is set only once, so after a frame has waited for the display it's
+/// a whole frame behind, and CoreFoundation walks it forward an interval at a
+/// time: some 200,000 steps a frame, which on an M1 at 60 fps took the main
+/// thread from 8.5% of a core to 10.6%.
+#[cfg(target_os = "macos")]
 fn until_the_redraw(now: Instant) -> ControlFlow {
     ControlFlow::WaitUntil(now + REDRAW_PATIENCE)
 }
@@ -470,7 +497,8 @@ fn until_the_redraw(_now: Instant) -> ControlFlow {
     ControlFlow::Poll
 }
 
-/// How long macOS and iOS are given to deliver a redraw before the loop asks again.
+/// How long macOS is given to deliver a redraw, and an iOS display link its next
+/// tick, before the loop stops waiting for it.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const REDRAW_PATIENCE: Duration = Duration::from_millis(100);
 
@@ -862,7 +890,17 @@ where
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let began = framelog::now();
-        self.plan_next_frame(event_loop);
+        if self.pacer.take_tick() {
+            self.frame(event_loop);
+        }
+        if self.plan_next_frame(event_loop) == Next::Draw {
+            self.frame(event_loop);
+            // Still due, which takes a cap far above what the game can draw: come
+            // straight back, having let the OS hand over what it has.
+            if self.plan_next_frame(event_loop) == Next::Draw {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+        }
         self.log.done(began);
         self.log.sleeping();
     }
@@ -876,8 +914,9 @@ where
     fn handle_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.frame(event_loop);
-            // UIKit hands out a redraw when it likes, which can be after the loop
-            // has settled down to wait for it. One more pass plans the next frame.
+            // The loop never asks UIKit for a redraw, so this is one of its own: the
+            // view has just appeared or changed size. That can be after the loop has
+            // settled down to wait. One more pass plans the next frame.
             #[cfg(target_os = "ios")]
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
@@ -993,23 +1032,24 @@ where
     }
 
     /// Decides when the loop runs next: at once, or after a sleep.
-    fn plan_next_frame(&mut self, event_loop: &ActiveEventLoop) {
+    fn plan_next_frame(&mut self, event_loop: &ActiveEventLoop) -> Next {
         let Some((ctx, game)) = &mut self.state else {
-            return;
+            return Next::Wait;
         };
         #[cfg(feature = "audio")]
         ctx.audio.poll();
         // The OS forbids drawing in the background. Sleep until `resumed`.
         if self.suspended {
+            self.pacer.pause();
             event_loop.set_control_flow(ControlFlow::Wait);
-            return;
+            return Next::Wait;
         }
         // winit remembers the redraw asked for before the pause and sends it
         // when the app resumes, so nothing else has to wake this up.
         #[cfg(target_os = "android")]
         if self.android_pause.is_paused() {
             event_loop.set_control_flow(ControlFlow::Wait);
-            return;
+            return Next::Wait;
         }
         // Nothing is presented while the window is minimized or can't be seen, so
         // vsync no longer paces the loop. Keep the game running, but at a capped
@@ -1017,10 +1057,11 @@ where
         let now = Instant::now();
         let hidden = ctx.window.is_minimized() || self.occluded || ctx.graphics.surface_hidden();
         if hidden && self.autoshot.path.is_none() {
+            self.pacer.pause();
             let next = self.last_frame + HIDDEN_FRAME_TIME;
             if now < next {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
-                return;
+                return Next::Wait;
             }
         }
         if self.refresh_checked.is_none_or(|at| now - at >= REFRESH_CHECK_TIME) {
@@ -1028,9 +1069,26 @@ where
             let monitor = ctx.window.inner.current_monitor();
             self.refresh = monitor.and_then(|m| m.refresh_rate_millihertz()).map(|mhz| mhz as f32 / 1000.0);
         }
+        // An iOS display shows a frame each time it refreshes, unless a cap sets a
+        // slower pace. Input needs no frame of its own: the next is a refresh away.
+        #[cfg(target_os = "ios")]
+        if hidden || ctx.timer.capped_below(self.refresh) {
+            self.pacer.pause();
+        } else {
+            self.wake = false;
+            self.pacer.run(self.refresh.unwrap_or(60.0));
+            if now - self.last_frame < REDRAW_PATIENCE {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + REDRAW_PATIENCE));
+                self.redraw_asked = true;
+                return Next::Wait;
+            }
+            // Nothing has been drawn for a while: the app has just started or come
+            // back, or the display has stopped saying when it refreshes.
+            return Next::Draw;
+        }
         // Under a frame cap, sleep until the next frame is due, unless input came in.
         if !std::mem::take(&mut self.wake)
-            && let Some(due) = ctx.timer.next_frame(self.last_frame, now, display_pacing(ctx, self.refresh))
+            && let Some(due) = ctx.timer.next_frame(self.last_frame, now)
         {
             let has_pads = ctx.gamepad.ids().next().is_some();
             let news = if has_pads { poll_gamepads(ctx, game) } else { PadNews::Nothing };
@@ -1046,7 +1104,7 @@ where
                     (false, _) => due,
                 };
                 event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
-                return;
+                return Next::Wait;
             }
         }
         if ctx.graphics.vsync()
@@ -1054,7 +1112,7 @@ where
             && let Some(due) = self.runaway.next_frame(self.last_frame, now, self.refresh)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(due));
-            return;
+            return Next::Wait;
         }
         #[cfg(target_os = "android")]
         if self.android_pause.asking_for_redraw() {
@@ -1062,12 +1120,28 @@ where
             #[cfg(feature = "audio")]
             ctx.audio.set_hold(crate::audio::Hold::Paused, true);
             event_loop.set_control_flow(ControlFlow::Wait);
-            return;
+            return Next::Wait;
         }
-        event_loop.set_control_flow(until_the_redraw(now));
-        ctx.window.inner.request_redraw();
-        self.redraw_asked = true;
+        #[cfg(target_os = "ios")]
+        return Next::Draw;
+        #[cfg(not(target_os = "ios"))]
+        {
+            event_loop.set_control_flow(until_the_redraw(now));
+            ctx.window.inner.request_redraw();
+            self.redraw_asked = true;
+            Next::Wait
+        }
     }
+}
+
+/// What the loop does once the next frame is planned.
+#[derive(Clone, Copy, PartialEq)]
+enum Next {
+    /// Goes back to sleep. The frame comes later, or winit was asked for it.
+    Wait,
+    /// Draws it now, itself. Only on iOS, where there's no redraw to ask for.
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    Draw,
 }
 
 #[cfg(test)]
