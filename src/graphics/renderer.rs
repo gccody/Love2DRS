@@ -5,12 +5,13 @@
 //! [`QuadInstance`]s (48 bytes each, expanded to corners by the vertex shader)
 //! and consecutive draws sharing a texture + state are merged into a single
 //! [`DrawCmd`]. Only user meshes use a classic vertex/index buffer. At the end
-//! of the frame everything is uploaded with one `write_buffer` per buffer and
-//! replayed in as few render passes as possible.
+//! of the frame everything is uploaded through one reused buffer ([`Staging`])
+//! and replayed in as few render passes as possible.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc;
 
 use super::Color;
 use super::image::{Gpu, IMAGE_FORMAT, Image};
@@ -308,18 +309,105 @@ impl GrowBuffer {
         }
     }
 
-    /// Uploads `data`, growing the buffer if needed. Returns true if reallocated.
-    fn upload(&mut self, gpu: &Gpu, data: &[u8]) -> bool {
-        let mut grew = false;
-        if data.len() as u64 > self.capacity {
-            let cap = (data.len() as u64).next_power_of_two();
-            *self = GrowBuffer::new(&gpu.device, self.label, self.usage, cap);
-            grew = true;
+    /// Makes room for `len` bytes, with a new buffer if this one is too small.
+    /// Returns true if it was.
+    fn fit(&mut self, gpu: &Gpu, len: usize) -> bool {
+        if len as u64 <= self.capacity {
+            return false;
         }
-        if !data.is_empty() {
-            gpu.queue.write_buffer(&self.buffer, 0, data);
+        let cap = (len as u64).next_power_of_two();
+        *self = GrowBuffer::new(&gpu.device, self.label, self.usage, cap);
+        true
+    }
+}
+
+/// The buffers a frame's data is written into on its way to the GPU.
+///
+/// `Queue::write_buffer` makes a buffer for each call, copies out of it in a
+/// command buffer of its own and frees it once the GPU is done, which on an M1
+/// was a fifth of what the main thread did per frame. One of these buffers holds
+/// everything a frame uploads. It's written while mapped, the frame's own commands
+/// copy out of it, and once the GPU has, it's mapped again for a later frame. Two
+/// or three go round.
+struct Staging {
+    /// Mapped, and waiting to be written.
+    free: Vec<wgpu::Buffer>,
+    /// Where buffers come back once they're mapped again.
+    back: mpsc::Receiver<wgpu::Buffer>,
+    done: mpsc::Sender<wgpu::Buffer>,
+}
+
+/// One frame's buffer, while it's being filled.
+struct Staged {
+    buffer: wgpu::Buffer,
+    view: wgpu::BufferViewMut,
+    used: u64,
+}
+
+/// What a frame uploads at the least, so that small frames share buffers.
+const STAGING_MIN: u64 = 1 << 16;
+/// Each part of a frame starts on a multiple of this, as mapping and copying ask.
+const STAGING_ALIGN: u64 = wgpu::MAP_ALIGNMENT;
+
+/// `len` bytes, as the whole words a buffer copy moves.
+fn staged_len(len: usize) -> u64 {
+    (len as u64).next_multiple_of(STAGING_ALIGN)
+}
+
+impl Staging {
+    fn new() -> Self {
+        let (done, back) = mpsc::channel();
+        Staging { free: Vec::new(), back, done }
+    }
+
+    /// A mapped buffer with room for `size` bytes.
+    fn begin(&mut self, gpu: &Gpu, size: u64) -> Option<Staged> {
+        self.free.extend(self.back.try_iter());
+        // Frames have outgrown anything smaller, so those are let go.
+        self.free.retain(|buffer| buffer.size() >= size);
+        let buffer = self.free.pop().unwrap_or_else(|| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("love2drs frame upload"),
+                size: size.next_power_of_two().max(STAGING_MIN),
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            })
+        });
+        match buffer.slice(..size).get_mapped_range_mut() {
+            Ok(view) => Some(Staged { buffer, view, used: 0 }),
+            Err(e) => {
+                log::warn!("couldn't write to a mapped buffer: {e}");
+                None
+            }
         }
-        grew
+    }
+
+    /// Hands a frame's buffer to its commands, to come back when they've run.
+    fn finish(&self, staged: Staged, encoder: &wgpu::CommandEncoder) {
+        let Staged { buffer, view, .. } = staged;
+        drop(view);
+        buffer.unmap();
+        let done = self.done.clone();
+        let mapped = buffer.clone();
+        encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Write, .., move |result| {
+            if result.is_ok() {
+                let _ = done.send(mapped);
+            }
+        });
+    }
+}
+
+impl Staged {
+    /// Writes `data`, and has `encoder` copy it to the start of `target`.
+    fn put(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Buffer, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let start = self.used as usize;
+        self.view.slice(start..start + data.len()).copy_from_slice(data);
+        let len = staged_len(data.len());
+        encoder.copy_buffer_to_buffer(&self.buffer, self.used, target, 0, len);
+        self.used += len;
     }
 }
 
@@ -446,6 +534,7 @@ pub(crate) struct Renderer {
     vertex_buffer: GrowBuffer,
     index_buffer: GrowBuffer,
     uniform_buffer: GrowBuffer,
+    staging: Staging,
     uniform_bind_group: wgpu::BindGroup,
     pub uniform_align: u32,
     /// Scratch for [`plan_clears`], kept so a frame doesn't allocate.
@@ -563,6 +652,7 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             uniform_buffer,
+            staging: Staging::new(),
             uniform_bind_group,
             uniform_align,
             clears: Vec::new(),
@@ -702,18 +792,42 @@ impl Renderer {
             timer.collect(&self.gpu);
         }
 
-        self.instance_buffer
-            .upload(&self.gpu, bytemuck::cast_slice(&frame.quads));
-        self.vertex_buffer
-            .upload(&self.gpu, bytemuck::cast_slice(&frame.vertices));
-        self.index_buffer
-            .upload(&self.gpu, bytemuck::cast_slice(&frame.indices));
-        if self.uniform_buffer.upload(&self.gpu, &frame.uniforms) {
+        let quads: &[u8] = bytemuck::cast_slice(&frame.quads);
+        let vertices: &[u8] = bytemuck::cast_slice(&frame.vertices);
+        let indices: &[u8] = bytemuck::cast_slice(&frame.indices);
+        self.instance_buffer.fit(&self.gpu, quads.len());
+        self.vertex_buffer.fit(&self.gpu, vertices.len());
+        self.index_buffer.fit(&self.gpu, indices.len());
+        if self.uniform_buffer.fit(&self.gpu, frame.uniforms.len()) {
             self.uniform_bind_group = Self::make_uniform_bind_group(
                 &self.gpu.device,
                 &self.uniform_layout,
                 &self.uniform_buffer.buffer,
             );
+        }
+        let uploads = [
+            (&self.instance_buffer, quads),
+            (&self.vertex_buffer, vertices),
+            (&self.index_buffer, indices),
+            (&self.uniform_buffer, &frame.uniforms[..]),
+        ];
+        let size: u64 = uploads.iter().map(|(_, data)| staged_len(data.len())).sum();
+        match (size > 0).then(|| self.staging.begin(&self.gpu, size)) {
+            Some(Some(mut staged)) => {
+                for (target, data) in uploads {
+                    staged.put(encoder, &target.buffer, data);
+                }
+                self.staging.finish(staged, encoder);
+            }
+            // The slow way still gets the frame drawn.
+            Some(None) => {
+                for (target, data) in uploads {
+                    if !data.is_empty() {
+                        self.gpu.queue.write_buffer(&target.buffer, 0, data);
+                    }
+                }
+            }
+            None => {}
         }
 
         let pass_range = |i: usize| {
